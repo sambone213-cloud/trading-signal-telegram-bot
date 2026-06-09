@@ -203,7 +203,7 @@ def calculate_levels(client, symbol: str) -> dict:
 
     try:
         # Daily bars — prior day H/L/C + multi-day swing levels
-        daily = _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Day", limit=15))
+        daily = _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Day", limit=15)) if client else pd.DataFrame()
         if not daily.empty and len(daily) >= 2:
             prev = daily.iloc[-2]
             levels["prior_high"]  = float(prev["high"])
@@ -220,7 +220,7 @@ def calculate_levels(client, symbol: str) -> dict:
                     levels["swing_lows"].append(round(float(lows[i]), 2))
 
         # 15-min bars for intraday swing highs/lows (last 3 sessions ≈ 78 bars)
-        bars_15 = _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="15Min", limit=78))
+        bars_15 = _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="15Min", limit=78)) if client else pd.DataFrame()
         if not bars_15.empty and len(bars_15) >= 5:
             h15 = bars_15["high"].values
             l15 = bars_15["low"].values
@@ -231,7 +231,7 @@ def calculate_levels(client, symbol: str) -> dict:
                     levels["swing_lows"].append(round(float(l15[i]), 2))
 
         # Pre-market bars (1-min bars today before 13:30 UTC = 9:30 ET)
-        bars_1m = _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Min", limit=120))
+        bars_1m = _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Min", limit=120)) if client else pd.DataFrame()
         if not bars_1m.empty:
             today_str = datetime.date.today().strftime("%Y-%m-%d")
             if "datetime" in bars_1m.columns:
@@ -449,8 +449,9 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict):
     for symbol in symbols:
         try:
             raw = _fetch_yf_bars(symbol, interval="1m", period="1d")
-            bars = raw if not raw.empty else _bars_to_df(
-                client.get_bars_ohlcv(symbol, timeframe="1Min", limit=200)
+            bars = raw if not raw.empty else (
+                _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Min", limit=200))
+                if client else pd.DataFrame()
             )
             if bars.empty or len(bars) < 20:
                 print(f"  [{symbol}] Not enough bars ({len(bars)})")
@@ -524,17 +525,19 @@ def main():
                         help="Optional extra levels to add (e.g. 540.0 542.5). Auto-levels always run.")
     args = parser.parse_args()
 
-    if AlpacaClient is None:
-        print("ERROR: alpaca_client not found. Make sure you're running from the quantdesk directory.")
-        sys.exit(1)
-
     api_key    = os.environ.get("ALPACA_API_KEY", "")
     api_secret = os.environ.get("ALPACA_API_SECRET", "")
-    if not api_key or not api_secret:
-        print("ERROR: Set ALPACA_API_KEY and ALPACA_API_SECRET environment variables.")
-        sys.exit(1)
 
-    client  = AlpacaClient(api_key=api_key, api_secret=api_secret)
+    # Alpaca is optional — yfinance is the primary data source
+    client = None
+    if AlpacaClient and api_key and api_secret:
+        try:
+            client = AlpacaClient(api_key=api_key, api_secret=api_secret)
+            print("  Data     : yfinance (primary) + Alpaca (fallback)")
+        except Exception:
+            print("  Data     : yfinance only (Alpaca init failed)")
+    else:
+        print("  Data     : yfinance only")
     tracker = DailyTracker()
 
     print(f"\n{'='*56}")

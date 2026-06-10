@@ -45,7 +45,7 @@ def _bars_to_df(bars: list) -> pd.DataFrame:
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
 
-from trade_strategies import run_all_strategies, StrategySignal
+from trade_strategies import run_all_strategies, StrategySignal, check_exit_conditions
 from position_manager import PositionManager
 from exit_manager import ExitManager
 
@@ -496,12 +496,32 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
             # Exit manager — evaluate open positions every scan
             if em:
                 try:
-                    current_prem = float(df["atr"].iloc[-1]) * 0.5  # rough proxy; real premium from Robinhood
+                    current_prem = float(df["atr"].iloc[-1]) * 0.5
                     exit_reason = em.evaluate(symbol, current_prem, df)
                     if exit_reason and "TIER1" not in exit_reason:
-                        # Full exit fired — free up position manager slot
                         if pm:
                             pm.force_close(_et_now())
+                except Exception:
+                    pass
+
+            # Strategy-level exit conditions — check if open position should be exited
+            if pm and pm._active_side and pm._active_strategy:
+                try:
+                    exit_hint = check_exit_conditions(df, pm._active_side, pm._active_strategy)
+                    if exit_hint:
+                        msg = (
+                            f"⚠️  EXIT SIGNAL  {symbol}\n"
+                            f"──────────────────────\n"
+                            f"Position : {pm._active_side.upper()} via {pm._active_strategy}\n"
+                            f"Signal   : {exit_hint}\n"
+                            f"Price    : ${price:.2f}\n"
+                            f"🕐 {_et_now().strftime('%H:%M ET')}"
+                        )
+                        print(f"\n{msg}")
+                        try:
+                            _get_tg().send_raw(msg)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -514,8 +534,8 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                 if _is_duplicate(symbol, sig, price, atr_val):
                     continue
 
-                # BB Reversal requires 10:30 ET minimum — mean reversion needs time to develop
-                if sig.strategy in ("BB Reversal", "BB+ADX Reversal") and _et_now().time() < datetime.time(10, 30):
+                # Mean reversion strategies require 10:30 ET minimum
+                if sig.strategy in ("BB+ADX Reversal", "Keltner Bounce") and _et_now().time() < datetime.time(10, 30):
                     continue
 
                 # Position manager gate — prevents flip-flopping and enforces max trades

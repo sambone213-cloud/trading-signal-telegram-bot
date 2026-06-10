@@ -46,6 +46,7 @@ def _bars_to_df(bars: list) -> pd.DataFrame:
     return df
 
 from trade_strategies import run_all_strategies, StrategySignal
+from position_manager import PositionManager
 
 try:
     from telegram_notify import get_notifier as _get_tg
@@ -164,6 +165,23 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # VWAP (session-level — resets each day via cumulative)
     if "volume" in df.columns:
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    # ADX-14
+    plus_dm  = df["high"].diff().clip(lower=0)
+    minus_dm = (-df["low"].diff()).clip(lower=0)
+    overlap  = (df["high"].diff() > 0) & (-df["low"].diff() > 0)
+    plus_dm[overlap & (df["high"].diff() < -df["low"].diff())]  = 0
+    minus_dm[overlap & (df["high"].diff() > -df["low"].diff())] = 0
+    atr14    = tr.rolling(14).mean()
+    df["plus_di"]  = 100 * plus_dm.rolling(14).mean() / atr14.replace(0, np.nan)
+    df["minus_di"] = 100 * minus_dm.rolling(14).mean() / atr14.replace(0, np.nan)
+    dx = 100 * (df["plus_di"] - df["minus_di"]).abs() / (df["plus_di"] + df["minus_di"]).replace(0, np.nan)
+    df["adx"] = dx.rolling(14).mean()
+
+    # VWMA-9 and VWMA-21
+    if "volume" in df.columns:
+        df["vwma9"]  = (close * df["volume"]).rolling(9).sum()  / df["volume"].rolling(9).sum()
+        df["vwma21"] = (close * df["volume"]).rolling(21).sum() / df["volume"].rolling(21).sum()
 
     return df
 
@@ -423,7 +441,7 @@ def _is_duplicate(symbol: str, sig: StrategySignal, price: float, atr: float) ->
 
 # ── Main scanner ─────────────────────────────────────────────────────────────
 
-def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict):
+def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: PositionManager = None):
     """One full scan pass across all symbols."""
 
     if not _market_open():
@@ -484,8 +502,17 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict):
                     continue
 
                 # BB Reversal requires 10:30 ET minimum — mean reversion needs time to develop
-                if sig.strategy == "BB Reversal" and _et_now().time() < datetime.time(10, 30):
+                if sig.strategy in ("BB Reversal", "BB+ADX Reversal") and _et_now().time() < datetime.time(10, 30):
                     continue
+
+                # Position manager gate — prevents flip-flopping and enforces max trades
+                if pm:
+                    bar_time = _et_now()
+                    ok, reason = pm.evaluate(sig, bar_time)
+                    if not ok:
+                        print(f"  [SUPPRESSED] {sig.strategy} {sig.side} — {reason}")
+                        continue
+                    pm.register(sig, bar_time)
 
                 near_lvl = _near_level(price, levels, atr_val)
 
@@ -539,6 +566,7 @@ def main():
     else:
         print("  Data     : yfinance only")
     tracker = DailyTracker()
+    pm      = PositionManager(lockout_minutes=15, max_trades_per_day=2)
 
     print(f"\n{'='*56}")
     print(f"  QuantDesk Alert Agent")
@@ -566,7 +594,7 @@ def main():
     while True:
         now_str = _et_now().strftime("%H:%M:%S ET")
         print(f"\n[{now_str}] Scanning {', '.join(args.symbols)}...")
-        scan(client, args.symbols, tracker, key_levels)
+        scan(client, args.symbols, tracker, key_levels, pm)
 
         # Telegram heartbeat every 10 min so you know it's alive on your phone
         if time.time() - _last_heartbeat >= HEARTBEAT_INTERVAL:

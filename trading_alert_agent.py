@@ -47,6 +47,7 @@ def _bars_to_df(bars: list) -> pd.DataFrame:
 
 from trade_strategies import run_all_strategies, StrategySignal
 from position_manager import PositionManager
+from exit_manager import ExitManager
 
 try:
     from telegram_notify import get_notifier as _get_tg
@@ -441,7 +442,7 @@ def _is_duplicate(symbol: str, sig: StrategySignal, price: float, atr: float) ->
 
 # ── Main scanner ─────────────────────────────────────────────────────────────
 
-def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: PositionManager = None):
+def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: PositionManager = None, em: ExitManager = None):
     """One full scan pass across all symbols."""
 
     if not _market_open():
@@ -492,6 +493,18 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                 f"ATR {atr_val:.2f}  {vix_str}"
             )
 
+            # Exit manager — evaluate open positions every scan
+            if em:
+                try:
+                    current_prem = float(df["atr"].iloc[-1]) * 0.5  # rough proxy; real premium from Robinhood
+                    exit_reason = em.evaluate(symbol, current_prem, df)
+                    if exit_reason and "TIER1" not in exit_reason:
+                        # Full exit fired — free up position manager slot
+                        if pm:
+                            pm.force_close(_et_now())
+                except Exception:
+                    pass
+
             if not signals:
                 continue
 
@@ -535,7 +548,13 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                 except Exception:
                     pass
 
-                # Trade count is managed manually — type "traded" in terminal to log
+                # Register entry in exit manager — starts tracking this position
+                if em:
+                    try:
+                        entry_premium = atr_val * 0.5  # rough proxy; replace with actual premium if known
+                        em.register_entry(symbol, sig, entry_premium, df)
+                    except Exception:
+                        pass
 
         except Exception as e:
             print(f"  [{symbol}] Error: {e}")
@@ -567,6 +586,7 @@ def main():
         print("  Data     : yfinance only")
     tracker = DailyTracker()
     pm      = PositionManager(lockout_minutes=15, max_trades_per_day=2)
+    em      = ExitManager(notifier=_get_tg())
 
     print(f"\n{'='*56}")
     print(f"  QuantDesk Alert Agent")
@@ -594,7 +614,7 @@ def main():
     while True:
         now_str = _et_now().strftime("%H:%M:%S ET")
         print(f"\n[{now_str}] Scanning {', '.join(args.symbols)}...")
-        scan(client, args.symbols, tracker, key_levels, pm)
+        scan(client, args.symbols, tracker, key_levels, pm, em)
 
         # Telegram heartbeat every 10 min so you know it's alive on your phone
         if time.time() - _last_heartbeat >= HEARTBEAT_INTERVAL:

@@ -719,7 +719,19 @@ def main():
 
     print("Levels loaded. Starting scanner — open Robinhood Legend and draw the levels above.\n")
 
-    _last_heartbeat = 0.0
+    # One explicit startup ping so deploys/restarts are distinguishable from
+    # heartbeats — repeated "restarted" messages = crash loop, investigate.
+    try:
+        _get_tg().send_raw(
+            f"🚀 <b>QuantDesk restarted</b> (deploy or crash recovery)\n"
+            f"Market {'OPEN' if _market_open() else 'closed'}  |  "
+            f"{_et_now().strftime('%H:%M:%S ET')}\n"
+            f"Heartbeats: every 10 min while market open"
+        )
+    except Exception:
+        pass
+
+    _last_heartbeat = time.time()   # first regular heartbeat comes after a full interval
     HEARTBEAT_INTERVAL        = 600    # market hours: every 10 minutes
     HEARTBEAT_CLOSED_INTERVAL = 14400  # market closed: every 4 hours, light ping
 

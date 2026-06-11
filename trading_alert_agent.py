@@ -366,6 +366,119 @@ def print_premarket_briefing(client, symbols: list):
     return all_levels
 
 
+# ── Market-open Telegram briefing ─────────────────────────────────────────────
+
+def build_open_briefing(client, symbol: str):
+    """
+    Build the market-open briefing text for one symbol.
+    Returns (text, flat_levels) — flat_levels refreshes the scanner's key
+    levels for the day. Uses Alpaca levels when available, yfinance fallback
+    for prior-day OHLC, premarket H/L, gap, and daily ATR.
+    """
+    lvls = calculate_levels(client, symbol)
+    today_et = _et_now().date()
+    daily_atr = None
+    gap_pct = None
+    pre_last = None
+
+    try:
+        import yfinance as yf
+
+        # Prior-day OHLC + daily ATR(14) from daily bars
+        daily = yf.Ticker(symbol).history(period="2mo", interval="1d", auto_adjust=False)
+        if not daily.empty:
+            if daily.index.tz is not None and _ET_ZONE is not None:
+                daily.index = daily.index.tz_convert(_ET_ZONE)
+            prior = daily[daily.index.date < today_et]
+            if len(prior) >= 1 and not lvls.get("prior_close"):
+                prev = prior.iloc[-1]
+                lvls["prior_close"] = round(float(prev["Close"]), 2)
+                lvls["prior_high"]  = round(float(prev["High"]), 2)
+                lvls["prior_low"]   = round(float(prev["Low"]), 2)
+            if len(prior) >= 15:
+                h, l, pc = prior["High"], prior["Low"], prior["Close"].shift(1)
+                tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+                daily_atr = float(tr.rolling(14).mean().iloc[-1])
+
+        # Premarket H/L and gap from today's extended-hours 1-min bars
+        pre = yf.Ticker(symbol).history(period="1d", interval="1m",
+                                        prepost=True, auto_adjust=False)
+        if not pre.empty:
+            if pre.index.tz is not None and _ET_ZONE is not None:
+                pre.index = pre.index.tz_convert(_ET_ZONE)
+            pre_today = pre[(pre.index.date == today_et) &
+                            (pre.index.time < datetime.time(9, 30))]
+            if not pre_today.empty:
+                lvls["premarket_high"] = round(float(pre_today["High"].max()), 2)
+                lvls["premarket_low"]  = round(float(pre_today["Low"].min()), 2)
+                pre_last = float(pre_today["Close"].iloc[-1])
+                if lvls.get("prior_close"):
+                    gap_pct = (pre_last - lvls["prior_close"]) / lvls["prior_close"] * 100
+    except Exception as e:
+        print(f"  [briefing] {symbol} data fetch: {e}")
+
+    vix = _fetch_vix()
+
+    # ── Outlook lines (data-driven, no predictions) ──────────────────────────
+    outlook = []
+    if gap_pct is not None:
+        if gap_pct >= 0.3:
+            outlook.append(f"Gap UP {gap_pct:+.2f}% — trend-day potential; "
+                           f"watch gap-fill to ${lvls['prior_close']:.2f} first")
+        elif gap_pct <= -0.3:
+            outlook.append(f"Gap DOWN {gap_pct:+.2f}% — trend-day potential; "
+                           f"bounce to ${lvls['prior_close']:.2f} would fill the gap")
+        else:
+            outlook.append(f"Flat open ({gap_pct:+.2f}%) — likely chop early, "
+                           f"let ORB define direction by 10:00")
+    if daily_atr and lvls.get("prior_close"):
+        lo = lvls["prior_close"] - daily_atr
+        hi = lvls["prior_close"] + daily_atr
+        outlook.append(f"Expected range (ATR14 ${daily_atr:.2f}): ${lo:.2f} – ${hi:.2f}")
+    if vix:
+        if vix >= VIX_DANGER:
+            outlook.append(f"VIX {vix:.1f} — DANGER, bot skips new entries today")
+        elif vix >= VIX_CAUTION:
+            outlook.append(f"VIX {vix:.1f} — elevated: 6+ OTM strikes for $0.30–0.60, size down")
+        elif vix >= 20:
+            outlook.append(f"VIX {vix:.1f} — moderately elevated: start 4 OTM")
+        else:
+            outlook.append(f"VIX {vix:.1f} — calm: 1–3 OTM strikes in premium range")
+
+    # ── Assemble message ─────────────────────────────────────────────────────
+    lines = [f"☀️ <b>MARKET OPEN — {symbol}</b>  {today_et.strftime('%a %b %d')}",
+             "──────────────────────"]
+    if lvls.get("prior_close"):
+        lines.append(f"Prior close ${lvls['prior_close']:.2f}  |  "
+                     f"H ${lvls['prior_high']:.2f} / L ${lvls['prior_low']:.2f}")
+    if lvls.get("premarket_high"):
+        pre_str = f"Pre-mkt H ${lvls['premarket_high']:.2f} / L ${lvls['premarket_low']:.2f}"
+        if pre_last:
+            pre_str += f"  |  last ${pre_last:.2f}"
+        lines.append(pre_str)
+    if lvls.get("swing_highs"):
+        lines.append("Swing highs: " + ", ".join(f"${v}" for v in lvls["swing_highs"]))
+    if lvls.get("swing_lows"):
+        lines.append("Swing lows: " + ", ".join(f"${v}" for v in lvls["swing_lows"]))
+    if outlook:
+        lines.append("──────────────────────")
+        lines.extend(outlook)
+    lines.append("──────────────────────")
+    lines.append("Today's windows:")
+    lines.append("9:45–10:00  Opening Drive (DI direction)")
+    lines.append("10:00+      ORB breakout watch")
+    lines.append("12:00       Lunch VWAP Hold")
+    lines.append("3:00–3:55   Power Hour Dip")
+    lines.append("All day     Dip Buy · Keltner · Momentum · Trend · VWAP · BB+ADX")
+
+    # Flat level list for the scanner's proximity checks
+    flat = [lvls[k] for k in ("prior_high", "prior_low", "prior_close",
+                              "premarket_high", "premarket_low") if lvls.get(k)]
+    flat += lvls.get("swing_highs", []) + lvls.get("swing_lows", [])
+
+    return "\n".join(lines), sorted(set(flat))
+
+
 # ── Level proximity check ─────────────────────────────────────────────────────
 
 def _near_level(price: float, levels: list, atr: float) -> Optional[float]:
@@ -683,7 +796,8 @@ def main():
     args = parser.parse_args()
 
     api_key    = os.environ.get("ALPACA_API_KEY", "")
-    api_secret = os.environ.get("ALPACA_API_SECRET", "")
+    # accept both names — .env / Railway use ALPACA_SECRET_KEY
+    api_secret = os.environ.get("ALPACA_API_SECRET") or os.environ.get("ALPACA_SECRET_KEY", "")
 
     # Alpaca is optional — yfinance is the primary data source
     client = None
@@ -734,10 +848,27 @@ def main():
     _last_heartbeat = time.time()   # first regular heartbeat comes after a full interval
     HEARTBEAT_INTERVAL        = 600    # market hours: every 10 minutes
     HEARTBEAT_CLOSED_INTERVAL = 14400  # market closed: every 4 hours, light ping
+    _briefing_day = None               # market-open briefing sent once per trading day
 
     while True:
         now_str = _et_now().strftime("%H:%M:%S ET")
         print(f"\n[{now_str}] Scanning {', '.join(args.symbols)}...")
+
+        # Market-open briefing: levels + outlook, once per day at first scan
+        # after 9:30. Also refreshes key levels (boot-time levels go stale).
+        if _market_open() and _briefing_day != _et_now().date():
+            for sym in args.symbols:
+                try:
+                    text, flat = build_open_briefing(client, sym)
+                    print(f"\n{text}\n")
+                    _get_tg().send_raw(text)
+                    if flat:
+                        manual = [float(l) for l in args.levels]
+                        key_levels[sym] = sorted(set(flat + manual))
+                except Exception as e:
+                    print(f"  [briefing] {sym}: {e}")
+            _briefing_day = _et_now().date()
+
         scan(client, args.symbols, tracker, key_levels, pm, em)
 
         # Telegram heartbeat so you know it's alive on your phone

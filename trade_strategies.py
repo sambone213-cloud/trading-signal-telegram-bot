@@ -469,9 +469,99 @@ def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str,
     return None
 
 
+# ── Strategy 7: Opening Range Breakout ───────────────────────────────────────
+
+def strategy_orb(df: pd.DataFrame) -> Optional[StrategySignal]:
+    """
+    Opening Range Breakout — price breaks above/below the 9:30-10:00 AM
+    high/low with volume and EMA confirmation.
+
+    The ORB high/low are the clearest levels on the chart every day.
+    When price breaks them with volume, it tends to run 2-3× the opening range.
+
+    Long:  close > ORB high + buffer, EMA9>21, vol>1.5x, not overbought
+    Short: close < ORB low  - buffer, EMA9<21, vol>1.5x, not oversold
+    SL: 1×ATR from entry (ORB level becomes support/resistance after break)
+    TP: entry ± 3×ATR
+    Valid: 10:00 AM – 2:30 PM ET only
+    """
+    if not _has(df, "close","high","low","ema9","ema21","atr","volume","hour_et","minute_et"):
+        return None
+
+    # Identify opening range bars: 9:30–9:59 ET
+    orb_mask = (df["hour_et"] == 9) & (df["minute_et"] >= 30)
+    orb_bars  = df[orb_mask]
+    if len(orb_bars) < 20:   # need at least 20 bars to define the range
+        return None
+
+    orb_high = float(orb_bars["high"].max())
+    orb_low  = float(orb_bars["low"].min())
+    orb_size = orb_high - orb_low
+    if orb_size <= 0: return None
+
+    c, p    = df.iloc[-1], df.iloc[-2]
+    close   = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    adx     = _get(df, "adx") or 15
+    hour_et = _get(df, "hour_et") or 0
+    min_et  = _get(df, "minute_et") or 0
+    if not all([close, atr, rsi]) or atr <= 0: return None
+
+    # Time gate: ORB must be complete (after 10:00 AM) and not too late (before 2:30 PM)
+    mins = _get(df, "mins_since_open") or 0
+    if mins < 30: return None
+    if hour_et > 14 or (hour_et == 14 and min_et > 30): return None
+
+    ema_bull = float(c["ema9"]) > float(c["ema21"])
+    ema_bear = float(c["ema9"]) < float(c["ema21"])
+
+    vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
+    vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
+    vol_ok = vol_r >= 1.5
+
+    # Break = prior bar at or below ORB level, current bar clears it by 0.1×ATR
+    buffer     = 0.1 * atr
+    break_up   = float(p["close"]) <= orb_high + buffer and float(c["close"]) > orb_high + buffer
+    break_down = float(p["close"]) >= orb_low  - buffer and float(c["close"]) < orb_low  - buffer
+
+    # Don't fire if we're already far from ORB (late-day re-test, not a clean break)
+    too_far_up   = float(c["close"]) > orb_high + 2.5 * orb_size
+    too_far_down = float(c["close"]) < orb_low  - 2.5 * orb_size
+
+    if break_up and ema_bull and vol_ok and rsi < 75 and not too_far_up:
+        conf = _score_confidence(df, 0.76, "long")
+        return StrategySignal(
+            "ORB Breakout", "long", close,
+            tp_price   = round(close + 3.0 * atr, 2),
+            sl_price   = round(close - 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = [f"Break above ORB ${orb_high:.2f}", "EMA9>21",
+                          f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}", f"ORB size ${orb_size:.2f}"],
+            exit_hints = [f"Price falls back below ORB ${orb_high:.2f}",
+                          "MACD crosses down with vol > 1.5x",
+                          "RSI > 80"],
+        )
+
+    if break_down and ema_bear and vol_ok and rsi > 25 and not too_far_down:
+        conf = _score_confidence(df, 0.76, "short")
+        return StrategySignal(
+            "ORB Breakout", "short", close,
+            tp_price   = round(close - 3.0 * atr, 2),
+            sl_price   = round(close + 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = [f"Break below ORB ${orb_low:.2f}", "EMA9<21",
+                          f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}", f"ORB size ${orb_size:.2f}"],
+            exit_hints = [f"Price reclaims ORB ${orb_low:.2f}",
+                          "MACD crosses up with vol > 1.5x",
+                          "RSI < 25"],
+        )
+
+    return None
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 ALL_STRATEGIES = {
+    "ORB Breakout":     strategy_orb,                # clean level break with volume
     "Power Hour Dip":   strategy_power_hour_dip,    # E=+1.00 WR 74%  3pm only
     "Keltner Bounce":   strategy_keltner_bounce,     # E=+0.73 WR 64%  ranging
     "Momentum Flip":    strategy_momentum_flip,      # E=+0.55 WR 62%  daily signal

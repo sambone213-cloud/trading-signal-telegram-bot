@@ -186,12 +186,19 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         vol_ma20       = df["volume"].rolling(20, min_periods=5).mean()
         df["vol_ratio"] = df["volume"] / vol_ma20.replace(0, np.nan)
 
-    # Momentum / time helpers
+    # Momentum / time helpers — per-bar from datetime column (needed for ORB)
     df["mom10"] = close - close.shift(10)
-    now_et = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
-    df["hour_et"]         = now_et.hour
-    df["minute_et"]       = now_et.minute
-    df["mins_since_open"] = max(0, (now_et.hour - 9) * 60 + now_et.minute - 30)
+    if "datetime" in df.columns:
+        # datetime stored as UTC; subtract 4h for EDT
+        dt_et = df["datetime"] - pd.Timedelta(hours=4)
+        df["hour_et"]         = dt_et.dt.hour
+        df["minute_et"]       = dt_et.dt.minute
+        df["mins_since_open"] = ((df["hour_et"] - 9) * 60 + df["minute_et"] - 30).clip(lower=0)
+    else:
+        now_et = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
+        df["hour_et"]         = now_et.hour
+        df["minute_et"]       = now_et.minute
+        df["mins_since_open"] = max(0, (now_et.hour - 9) * 60 + now_et.minute - 30)
 
     return df
 

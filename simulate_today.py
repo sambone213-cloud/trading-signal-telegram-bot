@@ -188,6 +188,7 @@ if not events:
           f"Price {'above' if last['close']>last['vwap'] else 'below'} VWAP")
     print()
     print("  Strategy gates:")
+    print(f"    ORB Breakout     : break above/below 9:30-10am high/low + vol >1.5x")
     print(f"    Momentum Flip    : EMA9/21 cross + MACD cross + vol >2x  (fires daily)")
     print(f"    Keltner Bounce   : ADX<28 + plus_di>minus_di  (ranging, bullish)")
     print(f"    Power Hour Dip   : 3-4pm + EMA9>EMA21  (uptrend only)")

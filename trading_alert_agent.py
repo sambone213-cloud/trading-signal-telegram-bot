@@ -181,8 +181,17 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # VWMA-9 and VWMA-21
     if "volume" in df.columns:
-        df["vwma9"]  = (close * df["volume"]).rolling(9).sum()  / df["volume"].rolling(9).sum()
-        df["vwma21"] = (close * df["volume"]).rolling(21).sum() / df["volume"].rolling(21).sum()
+        df["vwma9"]    = (close * df["volume"]).rolling(9).sum()  / df["volume"].rolling(9).sum()
+        df["vwma21"]   = (close * df["volume"]).rolling(21).sum() / df["volume"].rolling(21).sum()
+        vol_ma20       = df["volume"].rolling(20, min_periods=5).mean()
+        df["vol_ratio"] = df["volume"] / vol_ma20.replace(0, np.nan)
+
+    # Momentum / time helpers
+    df["mom10"] = close - close.shift(10)
+    now_et = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
+    df["hour_et"]         = now_et.hour
+    df["minute_et"]       = now_et.minute
+    df["mins_since_open"] = max(0, (now_et.hour - 9) * 60 + now_et.minute - 30)
 
     return df
 
@@ -428,7 +437,8 @@ class DailyTracker:
 
 # ── Signal deduplication — suppress repeat fires until strategy resets ────────
 
-_last_signal: dict = {}   # symbol -> {strategy -> last_fire_price}
+_last_signal: dict = {}          # symbol -> {strategy -> last_fire_price}
+_entry_times: dict = {}          # symbol -> entry datetime for bars_held calculation
 
 def _is_duplicate(symbol: str, sig: StrategySignal, price: float, atr: float) -> bool:
     """Return True if same strategy fired within 2×ATR of last fire price."""
@@ -507,7 +517,9 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
             # Strategy-level exit conditions — check if open position should be exited
             if pm and pm._active_side and pm._active_strategy:
                 try:
-                    exit_hint = check_exit_conditions(df, pm._active_side, pm._active_strategy)
+                    entry_dt  = _entry_times.get(symbol)
+                    bars_held = int(((_et_now() - entry_dt).total_seconds() / 60)) if entry_dt else 999
+                    exit_hint = check_exit_conditions(df, pm._active_side, pm._active_strategy, bars_held)
                     if exit_hint:
                         msg = (
                             f"⚠️  EXIT SIGNAL  {symbol}\n"
@@ -546,6 +558,7 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                         print(f"  [SUPPRESSED] {sig.strategy} {sig.side} — {reason}")
                         continue
                     pm.register(sig, bar_time)
+                    _entry_times[symbol] = bar_time
 
                 near_lvl = _near_level(price, levels, atr_val)
 

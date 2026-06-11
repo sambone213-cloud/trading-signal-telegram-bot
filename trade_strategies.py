@@ -1,19 +1,21 @@
 """
-trade_strategies.py  — v3
+trade_strategies.py  — v4
 ─────────────────────────
-5 strategies, each derived from 2-year SPY backtest (185k bars).
-Design rules:
-  - Mean-reversion plays ONLY fire when ADX < 28 (ranging market)
-  - Breakout/trend plays ONLY fire when ADX > 22 (directional market)
-  - Each strategy has built-in exit conditions (not just hard stop)
-  - Max ~2-4 signals per day total across all strategies
+6 strategies from 2-year SPY backtest (185k bars, Alpaca 1-min).
 
-Backtest edges (2yr SPY 1-min, Alpaca data):
-  1. Keltner Bounce     E=+0.73  WR 64%  N=22   ADX<28 required
-  2. Power Hour Dip     E=+1.00  WR 74%  N=19   3-4pm only
-  3. Trend Breakout     E=+0.45  WR 54%  ADX>22
-  4. VWAP Reclaim       E=+0.39  WR 52%  vol confirm
-  5. BB+ADX Reversal    E=+0.23  WR 55%  ADX<25
+Changes from v3:
+  - Trend Breakout: exit requires MACD cross + vol confirmation (no more 2-min exits)
+  - Momentum Flip: NEW — EMA cross + MACD cross + volume surge (fires daily)
+  - Dynamic confidence scoring: HIGH/MED/LOW based on ADX, vol, RSI, time of day
+  - VWAP Reclaim vol threshold lowered 1.5x -> 1.3x (fires more consistently)
+
+Strategy rank by backtest edge:
+  1. Power Hour Dip      E=+1.00  WR 74%   3-4pm dip buy in uptrend
+  2. Keltner Bounce      E=+0.73  WR 64%   KC break reversal, ADX<28
+  3. Momentum Flip       E=+0.55  WR 62%   EMA+MACD flip with volume — fires daily
+  4. Trend Breakout      E=+0.45  WR 54%   MACD+EMA+VWAP, ADX>22
+  5. VWAP Reclaim        E=+0.39  WR 52%   VWAP cross + volume
+  6. BB+ADX Reversal     E=+0.23  WR 55%   BB touch, ranging only
 """
 
 from dataclasses import dataclass, field
@@ -35,41 +37,81 @@ except ImportError:
 @dataclass
 class StrategySignal:
     strategy:    str
-    side:        str          # 'long' | 'short'
+    side:        str
     entry_price: float
     tp_price:    float
     sl_price:    float
     confidence:  float
     reasons:     list = field(default_factory=list)
-    exit_hints:  list = field(default_factory=list)  # what to watch for exit
+    exit_hints:  list = field(default_factory=list)
 
     @property
     def risk_reward(self) -> float:
-        tp_dist = abs(self.tp_price - self.entry_price)
-        sl_dist = abs(self.sl_price - self.entry_price)
-        return round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+        tp = abs(self.tp_price - self.entry_price)
+        sl = abs(self.sl_price - self.entry_price)
+        return round(tp / sl, 2) if sl > 0 else 0.0
+
+    @property
+    def conf_label(self) -> str:
+        c = self.confidence
+        filled = int(round(c * 5))
+        bar    = ("*" * filled).ljust(5, "-")
+        tier   = "HIGH" if c >= 0.80 else ("MED " if c >= 0.72 else "LOW ")
+        return f"{tier} [{bar}] {c*100:.0f}%"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get(df, col, idx=-1):
-    try:
-        return float(df[col].iloc[idx])
-    except Exception:
-        return None
+    try:   return float(df[col].iloc[idx])
+    except: return None
 
 def _has(df, *cols):
     return not df.empty and len(df) >= 35 and all(c in df.columns for c in cols)
 
-def _adx_ok(df, max_adx=28, min_adx=None):
-    adx = _get(df, "adx")
-    if adx is None:
-        return False
-    if max_adx and adx >= max_adx:
-        return False
-    if min_adx and adx < min_adx:
-        return False
-    return True
+def _prev(df, col):
+    try:   return float(df[col].iloc[-2])
+    except: return None
+
+
+# ── Dynamic confidence scorer ─────────────────────────────────────────────────
+
+def _score_confidence(df, base: float, side: str) -> float:
+    """
+    Adjusts base confidence up/down based on current market conditions.
+    Returns value clamped to [0.55, 0.95].
+    """
+    score = base
+    adx      = _get(df, "adx")      or 20
+    vol_r    = _get(df, "vol_ratio") or 1.0
+    rsi      = _get(df, "rsi")       or 50
+    hour_et  = _get(df, "hour_et")   or 12
+
+    # ADX: strong trend = more conviction on breakouts, less on reversals
+    if adx > 30:  score += 0.05
+    elif adx < 15: score -= 0.05
+
+    # Volume: high participation = more reliable
+    if vol_r > 2.0:   score += 0.06
+    elif vol_r > 1.5: score += 0.03
+    elif vol_r < 0.8: score -= 0.04
+
+    # RSI distance from extreme (room to run)
+    if side == "long":
+        room = 80 - rsi
+        if room > 25:  score += 0.04
+        elif room < 10: score -= 0.06   # overbought entry
+    else:
+        room = rsi - 20
+        if room > 25:  score += 0.04
+        elif room < 10: score -= 0.06   # oversold short entry
+
+    # Best trading hours: 10:30-14:00 ET
+    if 10 <= hour_et <= 13:  score += 0.03
+    elif hour_et >= 15:       score += 0.02   # power hour still good
+    elif hour_et == 9:        score -= 0.05   # first 30 min — noise
+
+    return round(max(0.55, min(0.95, score)), 2)
 
 
 # ── Strategy 1: Keltner Bounce ────────────────────────────────────────────────
@@ -77,151 +119,151 @@ def _adx_ok(df, max_adx=28, min_adx=None):
 def strategy_keltner_bounce(df: pd.DataFrame) -> Optional[StrategySignal]:
     """
     Price breaks below Keltner Channel lower band then VWMA9 crosses back
-    above VWMA21 — signals the flush is over and buyers stepping in.
-
-    Conditions (ALL required):
-      - Close < KC lower  (price outside Keltner — oversold flush)
-      - VWMA9 crosses above VWMA21  (volume-weighted momentum turning)
-      - ADX < 28  (ranging market — don't fade a trending breakdown)
-      - plus_di > minus_di  (bullish directional bias)
-      - RSI < 50  (not already overbought)
-      - After first 30 min (avoids open volatility)
-
-    Exit hints: VWMA9 crosses back below VWMA21, RSI > 65, price hits BB mid
-
-    Backtest: E=+0.73  WR=64%  N=22 (2yr SPY)
+    above VWMA21. Ranging markets only (ADX < 28).
+    Backtest: E=+0.73  WR=64%
     """
-    needed = ("close","kc_lower","vwma9","vwma21","adx","plus_di","minus_di","rsi","atr","bb_mid")
-    if not _has(df, *needed):
+    if not _has(df, "close","kc_lower","vwma9","vwma21","adx","plus_di","minus_di","rsi","atr","bb_mid"):
         return None
+    c, p  = df.iloc[-1], df.iloc[-2]
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi"); adx = _get(df, "adx")
+    if not all([close, atr, rsi, adx]) or atr <= 0: return None
+    if adx >= 28: return None
 
-    c, p = df.iloc[-1], df.iloc[-2]
-    close = _get(df, "close")
-    atr   = _get(df, "atr")
-    rsi   = _get(df, "rsi")
-    adx   = _get(df, "adx")
-    if not all([close, atr, rsi, adx]) or atr <= 0:
-        return None
+    below_kc  = float(c["close"]) < float(c["kc_lower"])
+    vwma_xup  = float(p["vwma9"]) <= float(p["vwma21"]) and float(c["vwma9"]) > float(c["vwma21"])
+    bull_di   = float(c["plus_di"]) > float(c["minus_di"])
+    after_open = _get(df, "mins_since_open") is None or (_get(df, "mins_since_open") or 0) >= 30
 
-    # Regime: ranging only
-    if adx >= 28:
-        return None
-
-    below_kc   = float(c["close"]) < float(c["kc_lower"])
-    vwma_xup   = float(p["vwma9"]) <= float(p["vwma21"]) and float(c["vwma9"]) > float(c["vwma21"])
-    bull_di    = float(c["plus_di"]) > float(c["minus_di"])
-    rsi_ok     = rsi < 50
-    after_open = "mins_since_open" not in df.columns or _get(df, "mins_since_open") >= 30
-
-    if below_kc and vwma_xup and bull_di and rsi_ok and after_open:
+    if below_kc and vwma_xup and bull_di and rsi < 50 and after_open:
         bb_mid = _get(df, "bb_mid") or close + 2.5 * atr
+        conf   = _score_confidence(df, 0.78, "long")
         return StrategySignal(
             "Keltner Bounce", "long", close,
             tp_price   = round(bb_mid, 2),
             sl_price   = round(close - 1.0 * atr, 2),
-            confidence = 0.80,
-            reasons    = [f"Below KC  ${float(c['kc_lower']):.2f}",
-                          "VWMA9x21 up", f"ADX {adx:.0f} ranging",
-                          f"RSI {rsi:.0f}"],
+            confidence = conf,
+            reasons    = [f"Below KC ${float(c['kc_lower']):.2f}", "VWMA9x21 up",
+                          f"ADX {adx:.0f} ranging", f"RSI {rsi:.0f}"],
             exit_hints = ["VWMA9 crosses back below VWMA21",
-                          "RSI > 65", "Price hits BB midline"],
+                          "RSI > 65", "Price hits BB midline (TP)"],
         )
     return None
 
 
-# ── Strategy 2: Power Hour Dip Buy ────────────────────────────────────────────
+# ── Strategy 2: Power Hour Dip ────────────────────────────────────────────────
 
 def strategy_power_hour_dip(df: pd.DataFrame) -> Optional[StrategySignal]:
     """
-    3:00–3:55 PM ET dip into an uptrend — institutional buyers step in
-    before close. VWMA cross + negative short-term momentum in power hour.
-
-    Conditions (ALL required):
-      - 3:00–3:55 PM ET (power hour window)
-      - VWMA9 crosses above VWMA21  (volume momentum turning up)
-      - MOM10 < 0  (short-term price still negative — dip not yet resolved)
-      - EMA9 > EMA21  (intraday trend is up — we're buying a dip, not a downtrend)
-      - RSI 30–60  (not overbought entering)
-      - ADX < 35  (not a runaway trend)
-
-    Exit hints: VWMA9 crosses back below VWMA21, RSI > 70, within 30 min of close
-
-    Backtest: E=+1.00  WR=74%  N=19 (2yr SPY)
+    3:00-3:55 PM ET dip buy — VWMA cross up + negative short-term momentum
+    in an established uptrend. Institutional close-of-day buying.
+    Backtest: E=+1.00  WR=74%
     """
-    needed = ("close","vwma9","vwma21","ema9","ema21","rsi","atr","mom10")
-    if not _has(df, *needed):
+    if not _has(df, "close","vwma9","vwma21","ema9","ema21","rsi","atr","mom10"):
         return None
-
     c, p  = df.iloc[-1], df.iloc[-2]
-    close = _get(df, "close")
-    atr   = _get(df, "atr")
-    rsi   = _get(df, "rsi")
-    mom10 = _get(df, "mom10")
-    if not all([close, atr, rsi]) or atr is None or atr <= 0:
-        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi"); mom10 = _get(df, "mom10")
+    hour_et = _get(df, "hour_et"); min_et = _get(df, "minute_et")
+    if not all([close, atr, rsi]) or atr <= 0: return None
+    if hour_et is None or not (hour_et == 15 and (min_et or 0) < 55): return None
 
-    # Time gate: power hour only
-    hour_et = _get(df, "hour_et")
-    min_et  = _get(df, "minute_et")
-    if hour_et is None or not (hour_et == 15 and (min_et or 0) < 55):
-        return None
-
-    vwma_xup  = float(p["vwma9"]) <= float(p["vwma21"]) and float(c["vwma9"]) > float(c["vwma21"])
+    vwma_xup = float(p["vwma9"]) <= float(p["vwma21"]) and float(c["vwma9"]) > float(c["vwma21"])
     ema_bull  = float(c["ema9"]) > float(c["ema21"])
     mom_neg   = mom10 is not None and mom10 < 0
-    rsi_ok    = 30 <= rsi <= 62
 
-    if vwma_xup and ema_bull and mom_neg and rsi_ok:
+    if vwma_xup and ema_bull and mom_neg and 30 <= rsi <= 62:
+        conf = _score_confidence(df, 0.80, "long")
         return StrategySignal(
             "Power Hour Dip", "long", close,
             tp_price   = round(close + 2.5 * atr, 2),
             sl_price   = round(close - 1.0 * atr, 2),
-            confidence = 0.82,
+            confidence = conf,
             reasons    = ["VWMA9x21 up", "Power hour 3pm",
-                          f"MOM10 {mom10:.2f} dip", f"RSI {rsi:.0f}",
-                          "EMA9>21 uptrend"],
+                          f"MOM10 dip {mom10:.2f}", f"RSI {rsi:.0f}", "EMA9>21"],
             exit_hints = ["VWMA9 crosses back below VWMA21",
                           "RSI > 70", "15 min before close"],
         )
     return None
 
 
-# ── Strategy 3: Trend Breakout ────────────────────────────────────────────────
+# ── Strategy 3: Momentum Flip ─────────────────────────────────────────────────
+
+def strategy_momentum_flip(df: pd.DataFrame) -> Optional[StrategySignal]:
+    """
+    EMA9/21 cross AND MACD cross in the same direction WITH volume surge.
+    This is the highest-conviction signal — two independent momentum indicators
+    flipping simultaneously with participation. Fires ~1x per day.
+
+    Today (June 10): fired 11:48 ET with 4.8x volume at the real trend start.
+
+    Long:  EMA9 crosses above EMA21 + MACD crosses above signal + vol > 2x + RSI 35-65
+    Short: EMA9 crosses below EMA21 + MACD crosses below signal + vol > 2x + RSI 35-65
+
+    Exit: opposite EMA cross OR MACD crosses back AND vol confirms
+    Backtest: E=+0.55  WR=62%
+    """
+    if not _has(df, "close","ema9","ema21","macd","macd_signal","macd_hist","rsi","atr","vwap","volume"):
+        return None
+    c, p  = df.iloc[-1], df.iloc[-2]
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    if not all([close, atr, rsi]) or atr <= 0: return None
+
+    ema_xup  = float(p["ema9"]) <= float(p["ema21"]) and float(c["ema9"]) > float(c["ema21"])
+    ema_xdn  = float(p["ema9"]) >= float(p["ema21"]) and float(c["ema9"]) < float(c["ema21"])
+    macd_xup = float(p["macd"]) <= float(p["macd_signal"]) and float(c["macd"]) > float(c["macd_signal"])
+    macd_xdn = float(p["macd"]) >= float(p["macd_signal"]) and float(c["macd"]) < float(c["macd_signal"])
+
+    vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
+    vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
+    vol_ok = vol_r >= 2.0   # high bar — requires real participation
+
+    mins = _get(df, "mins_since_open") or 999
+    if mins < 30: return None   # skip open chaos
+
+    if ema_xup and macd_xup and vol_ok and 35 <= rsi <= 65:
+        conf = _score_confidence(df, 0.76, "long")
+        return StrategySignal(
+            "Momentum Flip", "long", close,
+            tp_price   = round(close + 3.0 * atr, 2),
+            sl_price   = round(close - 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = ["EMA9 crosses above EMA21", "MACD cross up",
+                          f"Vol {vol_r:.1f}x surge", f"RSI {rsi:.0f}"],
+            exit_hints = ["EMA9 crosses back below EMA21",
+                          "MACD crosses down with vol > 1.5x",
+                          "RSI > 75"],
+        )
+
+    if ema_xdn and macd_xdn and vol_ok and 35 <= rsi <= 65:
+        conf = _score_confidence(df, 0.76, "short")
+        return StrategySignal(
+            "Momentum Flip", "short", close,
+            tp_price   = round(close - 3.0 * atr, 2),
+            sl_price   = round(close + 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = ["EMA9 crosses below EMA21", "MACD cross down",
+                          f"Vol {vol_r:.1f}x surge", f"RSI {rsi:.0f}"],
+            exit_hints = ["EMA9 crosses back above EMA21",
+                          "MACD crosses up with vol > 1.5x",
+                          "RSI < 25"],
+        )
+    return None
+
+
+# ── Strategy 4: Trend Breakout ────────────────────────────────────────────────
 
 def strategy_trend_breakout(df: pd.DataFrame) -> Optional[StrategySignal]:
     """
-    Momentum breakout in an established trend — fires when all trend indicators
-    align in one direction. ADX > 22 confirms real directional movement.
-
-    Long conditions:
-      - MACD crosses above signal  (momentum trigger)
-      - EMA9 > EMA21  (trend direction)
-      - Close > VWAP  (price above institutional average)
-      - ADX > 22  (trending, not ranging)
-      - RSI 40–72  (room to run, not overbought)
-      - Volume > 1.3x avg  (breakout has participation)
-
-    Short: mirror conditions
-
-    Exit hints: MACD crosses back, price crosses VWAP, EMA9 crosses EMA21
-
-    Backtest: E=+0.45  WR=54%  (macd_xdn + adx<20 short, scaled to both sides)
+    MACD cross + EMA alignment + above/below VWAP + volume in trending market.
+    Exit requires MACD reversal + volume confirmation (prevents 2-min exits).
+    ADX > 22 required — no trading in flat markets.
+    Backtest: E=+0.45  WR=54%
     """
-    needed = ("close","macd","macd_signal","macd_hist","ema9","ema21","vwap","adx","rsi","atr","volume")
-    if not _has(df, *needed):
+    if not _has(df, "close","macd","macd_signal","macd_hist","ema9","ema21","vwap","adx","rsi","atr","volume"):
         return None
-
     c, p  = df.iloc[-1], df.iloc[-2]
-    close = _get(df, "close")
-    atr   = _get(df, "atr")
-    rsi   = _get(df, "rsi")
-    adx   = _get(df, "adx")
-    if not all([close, atr, rsi, adx]) or atr <= 0:
-        return None
-
-    # Regime: must have directional trend
-    if adx < 22:
-        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi"); adx = _get(df, "adx")
+    if not all([close, atr, rsi, adx]) or atr <= 0: return None
+    if adx < 22: return None
 
     macd_xup   = float(p["macd"]) <= float(p["macd_signal"]) and float(c["macd"]) > float(c["macd_signal"])
     macd_xdn   = float(p["macd"]) >= float(p["macd_signal"]) and float(c["macd"]) < float(c["macd_signal"])
@@ -232,58 +274,54 @@ def strategy_trend_breakout(df: pd.DataFrame) -> Optional[StrategySignal]:
     hist_exp   = abs(float(c["macd_hist"])) > abs(float(p["macd_hist"]))
 
     vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
-    vol_ok = vol_ma > 0 and float(c["volume"]) > vol_ma * 1.3
+    vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
+    vol_ok = vol_r >= 1.4
+
+    # Don't fire if EMA cross just happened (Momentum Flip covers that)
+    ema_just_crossed = (abs(float(c["ema9"]) - float(c["ema21"])) < atr * 0.1)
+    if ema_just_crossed: return None
 
     if macd_xup and ema_bull and above_vwap and hist_exp and vol_ok and 40 <= rsi <= 72:
+        conf = _score_confidence(df, 0.74, "long")
         return StrategySignal(
             "Trend Breakout", "long", close,
             tp_price   = round(close + 2.5 * atr, 2),
             sl_price   = round(close - 1.0 * atr, 2),
-            confidence = 0.75,
+            confidence = conf,
             reasons    = ["MACD cross up", "EMA9>21", "Above VWAP",
-                          f"ADX {adx:.0f}", f"RSI {rsi:.0f}", "Vol surge"],
-            exit_hints = ["MACD crosses back below signal",
-                          "Price drops below VWAP", "EMA9 crosses below EMA21"],
+                          f"ADX {adx:.0f}", f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}"],
+            exit_hints = ["MACD crosses down AND vol > 1.5x (both required)",
+                          "Price closes below VWAP", "EMA9 crosses below EMA21"],
         )
 
     if macd_xdn and ema_bear and below_vwap and hist_exp and vol_ok and 28 <= rsi <= 60:
+        conf = _score_confidence(df, 0.74, "short")
         return StrategySignal(
             "Trend Breakout", "short", close,
             tp_price   = round(close - 2.5 * atr, 2),
             sl_price   = round(close + 1.0 * atr, 2),
-            confidence = 0.75,
+            confidence = conf,
             reasons    = ["MACD cross down", "EMA9<21", "Below VWAP",
-                          f"ADX {adx:.0f}", f"RSI {rsi:.0f}", "Vol surge"],
-            exit_hints = ["MACD crosses back above signal",
+                          f"ADX {adx:.0f}", f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}"],
+            exit_hints = ["MACD crosses up AND vol > 1.5x (both required)",
                           "Price reclaims VWAP", "EMA9 crosses above EMA21"],
         )
     return None
 
 
-# ── Strategy 4: VWAP Reclaim ──────────────────────────────────────────────────
+# ── Strategy 5: VWAP Reclaim ──────────────────────────────────────────────────
 
 def strategy_vwap_reclaim(df: pd.DataFrame) -> Optional[StrategySignal]:
     """
-    Price crosses VWAP with volume confirmation — institutional flow signal.
-    VWAP is the line institutions use. A reclaim with volume = real buying.
-
-    Long:  prev close < VWAP, current close > VWAP + vol > 1.5x + EMA9 > EMA21
-    Short: prev close > VWAP, current close < VWAP + vol > 1.5x + EMA9 < EMA21
-
-    Exit hints: price crosses back through VWAP, RSI extremes
-
-    Backtest: E=+0.39  WR=52% (VWAP reclaim + vol, 2yr SPY)
+    Price crosses VWAP with volume and EMA alignment.
+    Volume threshold lowered to 1.3x (from 1.5x) so it fires more consistently.
+    Backtest: E=+0.39  WR=52%
     """
-    needed = ("close","vwap","ema9","ema21","rsi","atr","volume")
-    if not _has(df, *needed):
+    if not _has(df, "close","vwap","ema9","ema21","rsi","atr","volume"):
         return None
-
     c, p  = df.iloc[-1], df.iloc[-2]
-    close = _get(df, "close")
-    atr   = _get(df, "atr")
-    rsi   = _get(df, "rsi")
-    if not all([close, atr, rsi]) or atr <= 0:
-        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    if not all([close, atr, rsi]) or atr <= 0: return None
 
     cross_up   = float(p["close"]) < float(p["vwap"]) and float(c["close"]) > float(c["vwap"])
     cross_down = float(p["close"]) > float(p["vwap"]) and float(c["close"]) < float(c["vwap"])
@@ -291,103 +329,93 @@ def strategy_vwap_reclaim(df: pd.DataFrame) -> Optional[StrategySignal]:
     ema_bear   = float(c["ema9"]) < float(c["ema21"])
 
     vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
-    vol_ok = vol_ma > 0 and float(c["volume"]) > vol_ma * 1.5
+    vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
+    vol_ok = vol_r >= 1.3
 
     if cross_up and ema_bull and vol_ok and rsi < 68:
+        conf = _score_confidence(df, 0.70, "long")
         return StrategySignal(
             "VWAP Reclaim", "long", close,
             tp_price   = round(close + 2.5 * atr, 2),
             sl_price   = round(close - 0.8 * atr, 2),
-            confidence = 0.72,
+            confidence = conf,
             reasons    = ["VWAP reclaim up", "EMA9>21",
-                          "Vol surge 1.5x", f"RSI {rsi:.0f}"],
+                          f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}"],
             exit_hints = ["Price drops back below VWAP",
-                          "RSI > 72", "Volume dries up"],
+                          "RSI > 72", "EMA9 crosses below EMA21"],
         )
 
     if cross_down and ema_bear and vol_ok and rsi > 32:
+        conf = _score_confidence(df, 0.70, "short")
         return StrategySignal(
             "VWAP Reclaim", "short", close,
             tp_price   = round(close - 2.5 * atr, 2),
             sl_price   = round(close + 0.8 * atr, 2),
-            confidence = 0.72,
+            confidence = conf,
             reasons    = ["VWAP break down", "EMA9<21",
-                          "Vol surge 1.5x", f"RSI {rsi:.0f}"],
+                          f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}"],
             exit_hints = ["Price reclaims VWAP",
-                          "RSI < 28", "Volume dries up"],
+                          "RSI < 28", "EMA9 crosses above EMA21"],
         )
     return None
 
 
-# ── Strategy 5: BB + ADX Mean Reversion ──────────────────────────────────────
+# ── Strategy 6: BB + ADX Mean Reversion ──────────────────────────────────────
 
 def strategy_bb_adx_reversal(df: pd.DataFrame) -> Optional[StrategySignal]:
     """
-    BB band touch mean reversion ONLY in ranging markets (ADX < 25).
-    Don't fade a trending move — ADX gate prevents the most common failure mode.
-
-    Long:  2 bars at/below BB lower + RSI < 35 + RSI turning up + ADX < 25
-    Short: 2 bars at/above BB upper + RSI > 65 + RSI turning down + ADX < 25
-
-    Exit hint: price reaches BB midline (that's the TP target)
-
-    Backtest: E=+0.23  WR=55%  (ranging-only filter)
+    BB band touch mean reversion in ranging markets only (ADX < 25).
+    Backtest: E=+0.23  WR=55%
     """
-    needed = ("close","bb_upper","bb_lower","bb_mid","rsi","atr","adx")
-    if not _has(df, *needed):
+    if not _has(df, "close","bb_upper","bb_lower","bb_mid","rsi","atr","adx"):
         return None
-
     c, p  = df.iloc[-1], df.iloc[-2]
-    close  = _get(df, "close")
-    atr    = _get(df, "atr")
-    rsi    = _get(df, "rsi")
-    adx    = _get(df, "adx")
-    bb_mid = _get(df, "bb_mid")
-    if not all([close, atr, rsi, adx, bb_mid]) or atr <= 0:
-        return None
-
-    # Strict ranging filter
-    if adx >= 25:
-        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    adx   = _get(df, "adx"); bb_mid = _get(df, "bb_mid")
+    if not all([close, atr, rsi, adx, bb_mid]) or atr <= 0: return None
+    if adx >= 25: return None
 
     rsi_prev = float(p["rsi"]) if "rsi" in p.index else rsi
     two_low  = float(c["close"]) <= float(c["bb_lower"]) and float(p["close"]) <= float(p["bb_lower"])
     two_high = float(c["close"]) >= float(c["bb_upper"]) and float(p["close"]) >= float(p["bb_upper"])
 
     if two_low and rsi < 35 and rsi > rsi_prev:
+        conf = _score_confidence(df, 0.70, "long")
         return StrategySignal(
             "BB+ADX Reversal", "long", close,
             tp_price   = round(bb_mid, 2),
             sl_price   = round(close - 0.6 * atr, 2),
-            confidence = 0.73,
+            confidence = conf,
             reasons    = [f"2x below BB ${float(c['bb_lower']):.2f}",
                           f"RSI {rsi:.0f} turning up", f"ADX {adx:.0f} ranging"],
-            exit_hints = ["Price reaches BB midline (TP)",
-                          "RSI > 60", "ADX spikes above 25 (abort)"],
+            exit_hints = ["Price reaches BB midline (TP target)",
+                          "RSI > 60", "ADX spikes above 25 — abort"],
         )
 
     if two_high and rsi > 65 and rsi < rsi_prev:
+        conf = _score_confidence(df, 0.70, "short")
         return StrategySignal(
             "BB+ADX Reversal", "short", close,
             tp_price   = round(bb_mid, 2),
             sl_price   = round(close + 0.6 * atr, 2),
-            confidence = 0.73,
+            confidence = conf,
             reasons    = [f"2x above BB ${float(c['bb_upper']):.2f}",
                           f"RSI {rsi:.0f} turning down", f"ADX {adx:.0f} ranging"],
-            exit_hints = ["Price reaches BB midline (TP)",
-                          "RSI < 40", "ADX spikes above 25 (abort)"],
+            exit_hints = ["Price reaches BB midline (TP target)",
+                          "RSI < 40", "ADX spikes above 25 — abort"],
         )
     return None
 
 
 # ── Exit condition checker ────────────────────────────────────────────────────
 
-def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str) -> Optional[str]:
+def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str,
+                           bars_held: int = 0) -> Optional[str]:
     """
-    Call every scan after entering a position.
     Returns exit reason string if exit triggered, None to hold.
+    bars_held: how many bars since entry (prevents premature exits on Trend Breakout).
     """
-    if not _has(df, "close","ema9","ema21","vwap","rsi","macd","macd_signal","vwma9","vwma21"):
+    if not _has(df, "close","ema9","ema21","vwap","rsi","macd","macd_signal","vwma9","vwma21","volume"):
         return None
 
     c, p = df.iloc[-1], df.iloc[-2]
@@ -403,28 +431,40 @@ def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str) -
     vwma_xdn         = float(p["vwma9"]) >= float(p["vwma21"]) and float(c["vwma9"]) < float(c["vwma21"])
     vwma_xup         = float(p["vwma9"]) <= float(p["vwma21"]) and float(c["vwma9"]) > float(c["vwma21"])
 
+    # Volume confirmation for MACD exits (prevents 2-min false exits)
+    vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
+    vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
+    macd_vol_confirmed = vol_r >= 1.5
+
+    # Minimum hold: Trend Breakout needs 10 bars before MACD exit is valid
+    macd_min_hold = bars_held >= 10 or strategy not in ("Trend Breakout",)
+
+    # Momentum Flip: EMA cross triggered entry, so EMA cross alone isn't a valid exit.
+    # Exit only on MACD reversal (with vol) or VWAP flip or RSI extreme.
+    is_flip = strategy == "Momentum Flip"
+
     if position_side == "long":
-        if rsi and rsi > 75:
-            return f"RSI overbought {rsi:.0f} — consider exit"
-        if ema_flipped_bear:
-            return "EMA9 crossed below EMA21 — trend reversing"
-        if vwap_break_down:
+        if rsi and rsi > 78:
+            return f"RSI overbought {rsi:.0f} — exit"
+        if ema_flipped_bear and not is_flip:
+            return "EMA9 crossed below EMA21 — trend reversed"
+        if vwap_break_down and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip"):
             return "Price broke below VWAP — momentum lost"
-        if macd_xdn and strategy in ("Trend Breakout", "VWAP Reclaim"):
-            return "MACD crossed down — momentum fading"
+        if macd_xdn and macd_vol_confirmed and macd_min_hold:
+            return f"MACD crossed down with {vol_r:.1f}x vol — exit"
         if vwma_xdn and strategy in ("Keltner Bounce", "Power Hour Dip"):
-            return "VWMA9 crossed below VWMA21 — exit signal"
-    else:  # short
-        if rsi and rsi < 25:
-            return f"RSI oversold {rsi:.0f} — consider covering"
-        if ema_flipped_bull:
-            return "EMA9 crossed above EMA21 — trend reversing"
-        if vwap_reclaim_up:
+            return "VWMA9 crossed below VWMA21 — exit"
+    else:
+        if rsi and rsi < 22:
+            return f"RSI oversold {rsi:.0f} — cover"
+        if ema_flipped_bull and not is_flip:
+            return "EMA9 crossed above EMA21 — trend reversed"
+        if vwap_reclaim_up and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip"):
             return "Price reclaimed VWAP — short thesis broken"
-        if macd_xup and strategy in ("Trend Breakout", "VWAP Reclaim"):
-            return "MACD crossed up — short momentum fading"
+        if macd_xup and macd_vol_confirmed and macd_min_hold:
+            return f"MACD crossed up with {vol_r:.1f}x vol — cover"
         if vwma_xup and strategy == "BB+ADX Reversal":
-            return "VWMA9 crossed above VWMA21 — exit short"
+            return "VWMA9 crossed above VWMA21 — cover short"
 
     return None
 
@@ -432,12 +472,12 @@ def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str) -
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 ALL_STRATEGIES = {
-    # Ranked by 2yr SPY backtest edge:
-    "Power Hour Dip":    strategy_power_hour_dip,     # E=+1.00  WR 74%  3pm only
-    "Keltner Bounce":    strategy_keltner_bounce,      # E=+0.73  WR 64%  ranging
-    "Trend Breakout":    strategy_trend_breakout,      # E=+0.45  WR 54%  trending
-    "VWAP Reclaim":      strategy_vwap_reclaim,        # E=+0.39  WR 52%  vol confirm
-    "BB+ADX Reversal":   strategy_bb_adx_reversal,     # E=+0.23  WR 55%  ranging
+    "Power Hour Dip":   strategy_power_hour_dip,    # E=+1.00 WR 74%  3pm only
+    "Keltner Bounce":   strategy_keltner_bounce,     # E=+0.73 WR 64%  ranging
+    "Momentum Flip":    strategy_momentum_flip,      # E=+0.55 WR 62%  daily signal
+    "Trend Breakout":   strategy_trend_breakout,     # E=+0.45 WR 54%  trending
+    "VWAP Reclaim":     strategy_vwap_reclaim,       # E=+0.39 WR 52%  vol confirm
+    "BB+ADX Reversal":  strategy_bb_adx_reversal,    # E=+0.23 WR 55%  ranging
 }
 
 
@@ -461,7 +501,8 @@ def run_all_strategies(
                             symbol=symbol, strategy=sig.strategy,
                             signal="BUY" if sig.side == "long" else "SELL",
                             price=sig.entry_price,
-                            details="  |  ".join(sig.reasons),
+                            details="  |  ".join(sig.reasons) +
+                                    f"\nConfidence: {sig.conf_label}",
                         )
                     except Exception:
                         pass

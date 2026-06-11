@@ -102,10 +102,19 @@ def _fetch_yf_bars(symbol: str, interval: str = "1m", period: str = "1d") -> pd.
 
 # ── Market session helpers ────────────────────────────────────────────────────
 
+try:
+    from zoneinfo import ZoneInfo
+    _ET_ZONE = ZoneInfo("America/New_York")
+except Exception:
+    _ET_ZONE = None   # fall back to fixed offset below
+
+
 def _et_now() -> datetime.datetime:
-    """Current time in US/Eastern as a naive datetime."""
-    utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-    return utc - datetime.timedelta(hours=4)
+    """Current time in US/Eastern as a naive datetime. DST-aware via zoneinfo."""
+    utc = datetime.datetime.now(datetime.timezone.utc)
+    if _ET_ZONE is not None:
+        return utc.astimezone(_ET_ZONE).replace(tzinfo=None)
+    return utc.replace(tzinfo=None) - datetime.timedelta(hours=4)
 
 
 def _market_open() -> bool:
@@ -176,9 +185,14 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["kc_upper"] = ema20_kc + 2 * atr10
     df["kc_lower"] = ema20_kc - 2 * atr10
 
-    # VWAP (session-level — resets each day via cumulative)
+    # VWAP (session-level — resets each trading day, not cumulative across days)
     if "volume" in df.columns:
-        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        if "datetime" in df.columns:
+            day = df["datetime"].dt.date
+            df["vwap"] = ((df["close"] * df["volume"]).groupby(day).cumsum()
+                          / df["volume"].groupby(day).cumsum())
+        else:
+            df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
     # ADX-14
     plus_dm  = df["high"].diff().clip(lower=0)
@@ -202,13 +216,17 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Momentum / time helpers — per-bar from datetime column (needed for ORB)
     df["mom10"] = close - close.shift(10)
     if "datetime" in df.columns:
-        # datetime stored as UTC; subtract 4h for EDT
-        dt_et = df["datetime"] - pd.Timedelta(hours=4)
-        df["hour_et"]         = dt_et.dt.hour
-        df["minute_et"]       = dt_et.dt.minute
+        if _ET_ZONE is not None:
+            dt_et = df["datetime"].dt.tz_convert(_ET_ZONE)
+            df["hour_et"]   = dt_et.dt.hour
+            df["minute_et"] = dt_et.dt.minute
+        else:
+            dt_et = df["datetime"] - pd.Timedelta(hours=4)
+            df["hour_et"]   = dt_et.dt.hour
+            df["minute_et"] = dt_et.dt.minute
         df["mins_since_open"] = ((df["hour_et"] - 9) * 60 + df["minute_et"] - 30).clip(lower=0)
     else:
-        now_et = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
+        now_et = _et_now()
         df["hour_et"]         = now_et.hour
         df["minute_et"]       = now_et.minute
         df["mins_since_open"] = max(0, (now_et.hour - 9) * 60 + now_et.minute - 30)
@@ -218,7 +236,7 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── VIX fetch ─────────────────────────────────────────────────────────────────
 
-def _fetch_vix(client) -> Optional[float]:
+def _fetch_vix(client=None) -> Optional[float]:
     """Fetch actual VIX index via yfinance (^VIX)."""
     try:
         import yfinance as yf
@@ -459,9 +477,15 @@ class DailyTracker:
 
 _last_signal: dict = {}          # symbol -> {strategy -> last_fire_price}
 _entry_times: dict = {}          # symbol -> entry datetime for bars_held calculation
+_signal_day = None               # resets the dedup memory each trading day
 
 def _is_duplicate(symbol: str, sig: StrategySignal, price: float, atr: float) -> bool:
     """Return True if same strategy fired within 2×ATR of last fire price."""
+    global _signal_day
+    today = _et_now().date()
+    if _signal_day != today:
+        _last_signal.clear()
+        _signal_day = today
     key = (symbol, sig.strategy, sig.side)
     last = _last_signal.get(key)
     if last is not None and abs(price - last) < 2 * atr:
@@ -560,7 +584,9 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                 try:
                     current_prem = float(df["atr"].iloc[-1]) * 0.5
                     exit_reason = em.evaluate(symbol, current_prem, df)
-                    if exit_reason and "TIER1" not in exit_reason:
+                    # TIER1 = scale out half, RUNNER = still holding — only a full
+                    # exit should free the position manager slot
+                    if exit_reason and "TIER1" not in exit_reason and "RUNNER" not in exit_reason:
                         if pm:
                             pm.force_close(_et_now())
                 except Exception:
@@ -694,15 +720,27 @@ def main():
     print("Levels loaded. Starting scanner — open Robinhood Legend and draw the levels above.\n")
 
     _last_heartbeat = 0.0
-    HEARTBEAT_INTERVAL = 600  # send Telegram status every 10 minutes
+    HEARTBEAT_INTERVAL        = 600    # market hours: every 10 minutes
+    HEARTBEAT_CLOSED_INTERVAL = 14400  # market closed: every 4 hours, light ping
 
     while True:
         now_str = _et_now().strftime("%H:%M:%S ET")
         print(f"\n[{now_str}] Scanning {', '.join(args.symbols)}...")
         scan(client, args.symbols, tracker, key_levels, pm, em)
 
-        # Telegram heartbeat every 10 min so you know it's alive on your phone
-        if time.time() - _last_heartbeat >= HEARTBEAT_INTERVAL:
+        # Telegram heartbeat so you know it's alive on your phone
+        hb_interval = HEARTBEAT_INTERVAL if _market_open() else HEARTBEAT_CLOSED_INTERVAL
+        if time.time() - _last_heartbeat >= hb_interval:
+            if not _market_open():
+                try:
+                    _get_tg().send_raw(
+                        f"🤖 <b>QuantDesk alive</b> — market closed  |  {now_str}"
+                    )
+                except Exception:
+                    pass
+                _last_heartbeat = time.time()
+                time.sleep(args.interval)
+                continue
             try:
                 vix_now = _fetch_vix() or 0.0
                 # get latest price/RSI from last scan for each symbol
@@ -724,7 +762,7 @@ def main():
                     f"──────────────────────\n"
                     f"{body}\n"
                     f"VIX {vix_now:.1f}  |  {now_str}\n"
-                    f"No signals yet — watching 👀"
+                    f"{pm.status if pm else 'watching 👀'}"
                 )
                 _last_heartbeat = time.time()
             except Exception:

@@ -28,6 +28,20 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict
 from trade_strategies import StrategySignal
 
+try:
+    from zoneinfo import ZoneInfo
+    _ET_ZONE = ZoneInfo("America/New_York")
+except Exception:
+    _ET_ZONE = None
+
+
+def _now_et() -> datetime.datetime:
+    """Eastern time regardless of server timezone (Railway runs UTC)."""
+    utc = datetime.datetime.now(datetime.timezone.utc)
+    if _ET_ZONE is not None:
+        return utc.astimezone(_ET_ZONE).replace(tzinfo=None)
+    return utc.replace(tzinfo=None) - datetime.timedelta(hours=4)
+
 
 @dataclass
 class OpenPosition:
@@ -73,7 +87,7 @@ class ExitManager:
             side=sig.side,
             entry_price=sig.entry_price,
             entry_premium=entry_premium,
-            entry_time=datetime.datetime.now(),
+            entry_time=_now_et(),
             entry_df_rsi=rsi,
             entry_df_vwap=vwap,
             entry_df_ema9=ema9,
@@ -171,7 +185,8 @@ class ExitManager:
         return reason
 
     def _send(self, symbol, pos, close, underlying_pnl, message):
-        held      = int((datetime.datetime.now() - pos.entry_time).total_seconds() / 60)
+        now_et    = _now_et()
+        held      = int((now_et - pos.entry_time).total_seconds() / 60)
         move_str  = f"${underlying_pnl:+.2f} {'in your favour' if underlying_pnl > 0 else 'against you'}"
         text = (
             f"{message}\n"
@@ -179,7 +194,7 @@ class ExitManager:
             f"📐 {pos.strategy}  {pos.side.upper()}\n"
             f"💲 Entry: ${pos.entry_price:.2f}  →  Now: ${close:.2f}\n"
             f"📊 Underlying move: {move_str}  |  Held: {held}m\n"
-            f"🕐 {datetime.datetime.now().strftime('%H:%M ET')}"
+            f"🕐 {now_et.strftime('%H:%M ET')}"
         )
         print(f"\n{message} — {symbol} underlying {move_str}")
         if self._tg:

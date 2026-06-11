@@ -1,13 +1,14 @@
 """
-trade_strategies.py  — v4
+trade_strategies.py  — v5
 ─────────────────────────
-6 strategies from 2-year SPY backtest (185k bars, Alpaca 1-min).
+10 strategies. Original 7 from the 2-year SPY backtest; 3 new (Jun 2026)
+walk-forward validated on 17 months of SPY 1-min via backtest_explorer.py
+(128k bars, Alpaca IEX, 3 rolling train/test windows, 1,426 candidates).
 
-Changes from v3:
-  - Trend Breakout: exit requires MACD cross + vol confirmation (no more 2-min exits)
-  - Momentum Flip: NEW — EMA cross + MACD cross + volume surge (fires daily)
-  - Dynamic confidence scoring: HIGH/MED/LOW based on ADX, vol, RSI, time of day
-  - VWAP Reclaim vol threshold lowered 1.5x -> 1.3x (fires more consistently)
+Changes from v4:
+  - NEW Oversold Dip Buy:  RSI<25 panic + EMA21>EMA50 — held-out edge beat training
+  - NEW Opening Drive:     9:45-10:00 DI-direction trade — most stable setup in sweep
+  - NEW Lunch VWAP Hold:   12pm above-VWAP long — short variant tested weak, excluded
 
 Strategy rank by backtest edge:
   1. Power Hour Dip      E=+1.00  WR 74%   3-4pm dip buy in uptrend
@@ -15,7 +16,10 @@ Strategy rank by backtest edge:
   3. Momentum Flip       E=+0.55  WR 62%   EMA+MACD flip with volume — fires daily
   4. Trend Breakout      E=+0.45  WR 54%   MACD+EMA+VWAP, ADX>22
   5. VWAP Reclaim        E=+0.39  WR 52%   VWAP cross + volume
-  6. BB+ADX Reversal     E=+0.23  WR 55%   BB touch, ranging only
+  6. Oversold Dip Buy    E=+0.37  WR 49%   RSI<25 flush in uptrend (walk-forward)
+  7. Opening Drive       E=+0.31  WR 50%   first-30min DI direction (walk-forward)
+  8. Lunch VWAP Hold     E=+0.31  WR 49%   12pm VWAP hold, long only (walk-forward)
+  9. BB+ADX Reversal     E=+0.23  WR 55%   BB touch, ranging only
 """
 
 from dataclasses import dataclass, field
@@ -476,11 +480,14 @@ def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str,
     is_flip = strategy == "Momentum Flip"
 
     if position_side == "long":
+        if rsi and rsi > 60 and strategy == "Oversold Dip Buy":
+            return f"RSI recovered to {rsi:.0f} — dip-buy target reached"
         if rsi and rsi > 78:
             return f"RSI overbought {rsi:.0f} — exit"
         if ema_flipped_bear and not is_flip:
             return "EMA9 crossed below EMA21 — trend reversed"
-        if vwap_break_down and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip"):
+        if vwap_break_down and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip",
+                                            "Opening Drive", "Lunch VWAP Hold"):
             return "Price broke below VWAP — momentum lost"
         if macd_xdn and macd_vol_confirmed and macd_min_hold:
             return f"MACD crossed down with {vol_r:.1f}x vol — exit"
@@ -491,7 +498,8 @@ def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str,
             return f"RSI oversold {rsi:.0f} — cover"
         if ema_flipped_bull and not is_flip:
             return "EMA9 crossed above EMA21 — trend reversed"
-        if vwap_reclaim_up and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip"):
+        if vwap_reclaim_up and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip",
+                                            "Opening Drive"):
             return "Price reclaimed VWAP — short thesis broken"
         if macd_xup and macd_vol_confirmed and macd_min_hold:
             return f"MACD crossed up with {vol_r:.1f}x vol — cover"
@@ -604,6 +612,129 @@ def strategy_orb(df: pd.DataFrame) -> Optional[StrategySignal]:
     return None
 
 
+# ── Strategy 8: Oversold Dip Buy ─────────────────────────────────────────────
+
+def strategy_oversold_dip(df: pd.DataFrame) -> Optional[StrategySignal]:
+    """
+    RSI < 25 panic flush while the medium-term trend is still up (EMA21 > EMA50).
+    Buy the fear, ride the snap-back. After first 30 min only.
+
+    Walk-forward validated on 17 months of SPY 1-min (128k bars, Alpaca):
+    test edge +0.37, WR 49%, ~1.5 fires/day. Held-out edge BEAT training
+    edge (decay -50%) — the opposite of overfit.
+    """
+    if not _has(df, "close","rsi","ema21","ema50","atr"):
+        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    ema21 = _get(df, "ema21"); ema50 = _get(df, "ema50")
+    # Explicit None checks — a full-panic flush gives RSI exactly 0.0, which is
+    # falsy and would wrongly fail an all([...]) check right when we want to fire
+    if any(v is None for v in (close, atr, rsi, ema21, ema50)) or atr <= 0:
+        return None
+
+    mins = _get(df, "mins_since_open") or 999
+    if mins < 30: return None
+
+    if rsi < 25 and ema21 > ema50:
+        conf = _score_confidence(df, 0.78, "long")
+        return StrategySignal(
+            "Oversold Dip Buy", "long", close,
+            tp_price   = round(close + 2.5 * atr, 2),
+            sl_price   = round(close - 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = [f"RSI {rsi:.0f} panic flush", "EMA21>50 uptrend intact"],
+            exit_hints = ["RSI recovers above 60",
+                          "EMA21 crosses below EMA50 — uptrend broken"],
+        )
+    return None
+
+
+# ── Strategy 9: Opening Drive ─────────────────────────────────────────────────
+
+def strategy_opening_drive(df: pd.DataFrame) -> Optional[StrategySignal]:
+    """
+    First 30 minutes: trade WITH the directional money flow (+DI vs -DI).
+    The single most stable setup in the 17-month sweep — long side decayed
+    only 1% between training and held-out data.
+
+    NOTE: agent skips scans before 9:45 ET (Vishy rule), so the live
+    window is 9:45-10:00. Fires nearly every day — will usually consume
+    one of the 2 daily trade slots.
+
+    Backtest: long E=+0.31 WR=50%, short E=+0.27 WR=48%, ~1.1 fires/day
+    """
+    if not _has(df, "close","plus_di","minus_di","rsi","atr"):
+        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    pdi   = _get(df, "plus_di"); mdi = _get(df, "minus_di")
+    if not all([close, atr, rsi]) or atr <= 0: return None
+    if pdi is None or mdi is None: return None
+
+    mins = _get(df, "mins_since_open")
+    if mins is None or mins >= 30: return None
+
+    if pdi > mdi:
+        conf = _score_confidence(df, 0.74, "long")
+        return StrategySignal(
+            "Opening Drive", "long", close,
+            tp_price   = round(close + 2.5 * atr, 2),
+            sl_price   = round(close - 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = [f"+DI {pdi:.0f} > -DI {mdi:.0f} buyers in control",
+                          "Opening 30 min drive", f"RSI {rsi:.0f}"],
+            exit_hints = ["Price breaks below VWAP",
+                          "-DI crosses above +DI", "RSI > 75"],
+        )
+
+    if mdi > pdi:
+        conf = _score_confidence(df, 0.74, "short")
+        return StrategySignal(
+            "Opening Drive", "short", close,
+            tp_price   = round(close - 2.5 * atr, 2),
+            sl_price   = round(close + 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = [f"-DI {mdi:.0f} > +DI {pdi:.0f} sellers in control",
+                          "Opening 30 min drive", f"RSI {rsi:.0f}"],
+            exit_hints = ["Price reclaims VWAP",
+                          "+DI crosses above -DI", "RSI < 25"],
+        )
+    return None
+
+
+# ── Strategy 10: Lunch VWAP Hold ──────────────────────────────────────────────
+
+def strategy_lunch_vwap_hold(df: pd.DataFrame) -> Optional[StrategySignal]:
+    """
+    Lunch hour (12:00-12:59 ET): price holding above session VWAP means
+    buyers stayed in control through the midday chop — institutions add
+    into the afternoon. Long only: the short variant tested weak (+0.12)
+    and is deliberately excluded.
+
+    Backtest: E=+0.31  WR=49%  ~1.2 fires/day  (held-out beat training, decay -25%)
+    """
+    if not _has(df, "close","vwap","rsi","atr"):
+        return None
+    close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
+    vwap  = _get(df, "vwap")
+    hour_et = _get(df, "hour_et")
+    if not all([close, atr, rsi, vwap]) or atr <= 0: return None
+    if hour_et is None or hour_et != 12: return None
+
+    if close > vwap:
+        conf = _score_confidence(df, 0.72, "long")
+        return StrategySignal(
+            "Lunch VWAP Hold", "long", close,
+            tp_price   = round(close + 2.5 * atr, 2),
+            sl_price   = round(close - 1.0 * atr, 2),
+            confidence = conf,
+            reasons    = [f"Holding above VWAP ${vwap:.2f} through lunch",
+                          f"RSI {rsi:.0f}"],
+            exit_hints = ["Price breaks below VWAP",
+                          "RSI > 75", "EMA9 crosses below EMA21"],
+        )
+    return None
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 ALL_STRATEGIES = {
@@ -614,6 +745,10 @@ ALL_STRATEGIES = {
     "Trend Breakout":   strategy_trend_breakout,     # E=+0.45 WR 54%  trending
     "VWAP Reclaim":     strategy_vwap_reclaim,       # E=+0.39 WR 52%  vol confirm
     "BB+ADX Reversal":  strategy_bb_adx_reversal,    # E=+0.23 WR 55%  ranging
+    # v5 — walk-forward validated on 17mo SPY 1-min (backtest_explorer.py, Jun 2026)
+    "Oversold Dip Buy": strategy_oversold_dip,       # E=+0.37 WR 49%  panic dip in uptrend
+    "Opening Drive":    strategy_opening_drive,      # E=+0.31 WR 50%  9:45-10:00 DI direction
+    "Lunch VWAP Hold":  strategy_lunch_vwap_hold,    # E=+0.31 WR 49%  12pm VWAP hold, long only
 }
 
 

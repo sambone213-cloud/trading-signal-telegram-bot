@@ -190,57 +190,81 @@ def strategy_power_hour_dip(df: pd.DataFrame) -> Optional[StrategySignal]:
 def strategy_momentum_flip(df: pd.DataFrame) -> Optional[StrategySignal]:
     """
     EMA9/21 cross AND MACD cross in the same direction WITH volume surge.
-    This is the highest-conviction signal — two independent momentum indicators
-    flipping simultaneously with participation. Fires ~1x per day.
+    One cross triggers, the other must confirm within a 3-bar window — EMA and
+    MACD almost never align on the exact same 1-min bar.
 
-    Today (June 10): fired 11:48 ET with 4.8x volume at the real trend start.
-
-    Long:  EMA9 crosses above EMA21 + MACD crosses above signal + vol > 2x + RSI 35-65
-    Short: EMA9 crosses below EMA21 + MACD crosses below signal + vol > 2x + RSI 35-65
+    Long:  EMA9 recently crossed above EMA21 + MACD currently bullish (or vice versa)
+           + vol > 1.5x + RSI 35-65 + both currently aligned
+    Short: mirror image
 
     Exit: opposite EMA cross OR MACD crosses back AND vol confirms
     Backtest: E=+0.55  WR=62%
     """
     if not _has(df, "close","ema9","ema21","macd","macd_signal","macd_hist","rsi","atr","vwap","volume"):
         return None
-    c, p  = df.iloc[-1], df.iloc[-2]
+    c     = df.iloc[-1]
     close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
     if not all([close, atr, rsi]) or atr <= 0: return None
 
-    ema_xup  = float(p["ema9"]) <= float(p["ema21"]) and float(c["ema9"]) > float(c["ema21"])
-    ema_xdn  = float(p["ema9"]) >= float(p["ema21"]) and float(c["ema9"]) < float(c["ema21"])
-    macd_xup = float(p["macd"]) <= float(p["macd_signal"]) and float(c["macd"]) > float(c["macd_signal"])
-    macd_xdn = float(p["macd"]) >= float(p["macd_signal"]) and float(c["macd"]) < float(c["macd_signal"])
+    mins = _get(df, "mins_since_open") or 999
+    if mins < 30: return None
+
+    # Check for a cross anywhere in the last 3 bars
+    lb = min(3, len(df) - 1)
+
+    def _recent_xup(col_a, col_b):
+        for i in range(len(df) - lb, len(df)):
+            if i > 0 and df[col_a].iloc[i-1] <= df[col_b].iloc[i-1] and df[col_a].iloc[i] > df[col_b].iloc[i]:
+                return True
+        return False
+
+    def _recent_xdn(col_a, col_b):
+        for i in range(len(df) - lb, len(df)):
+            if i > 0 and df[col_a].iloc[i-1] >= df[col_b].iloc[i-1] and df[col_a].iloc[i] < df[col_b].iloc[i]:
+                return True
+        return False
+
+    ema_xup_recent  = _recent_xup("ema9", "ema21")
+    ema_xdn_recent  = _recent_xdn("ema9", "ema21")
+    macd_xup_recent = _recent_xup("macd", "macd_signal")
+    macd_xdn_recent = _recent_xdn("macd", "macd_signal")
+
+    # Both must currently agree on direction
+    ema_bull_now  = float(c["ema9"]) > float(c["ema21"])
+    ema_bear_now  = float(c["ema9"]) < float(c["ema21"])
+    macd_bull_now = float(c["macd"]) > float(c["macd_signal"])
+    macd_bear_now = float(c["macd"]) < float(c["macd_signal"])
 
     vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
     vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
-    vol_ok = vol_r >= 2.0   # high bar — requires real participation
+    vol_ok = vol_r >= 1.5   # lowered from 2.0 — 2x was rarely hit on SPY 1-min bars
 
-    mins = _get(df, "mins_since_open") or 999
-    if mins < 30: return None   # skip open chaos
-
-    if ema_xup and macd_xup and vol_ok and 35 <= rsi <= 65:
+    if (ema_xup_recent or macd_xup_recent) and ema_bull_now and macd_bull_now and vol_ok and 35 <= rsi <= 65:
+        trigger = "EMA9 crosses above EMA21" if ema_xup_recent else "MACD cross up"
+        confirm = "MACD bull" if ema_xup_recent else "EMA9>21"
         conf = _score_confidence(df, 0.76, "long")
         return StrategySignal(
             "Momentum Flip", "long", close,
             tp_price   = round(close + 3.0 * atr, 2),
             sl_price   = round(close - 1.0 * atr, 2),
             confidence = conf,
-            reasons    = ["EMA9 crosses above EMA21", "MACD cross up",
+            reasons    = [trigger, confirm,
                           f"Vol {vol_r:.1f}x surge", f"RSI {rsi:.0f}"],
             exit_hints = ["EMA9 crosses back below EMA21",
                           "MACD crosses down with vol > 1.5x",
                           "RSI > 75"],
         )
 
-    if ema_xdn and macd_xdn and vol_ok and 35 <= rsi <= 65:
+    if (ema_xdn_recent or macd_xdn_recent) and ema_bear_now and macd_bear_now and vol_ok and 35 <= rsi <= 65:
+        trigger = "EMA9 crosses below EMA21" if ema_xdn_recent else "MACD cross down"
+        confirm = "MACD bear" if ema_xdn_recent else "EMA9<21"
         conf = _score_confidence(df, 0.76, "short")
         return StrategySignal(
             "Momentum Flip", "short", close,
             tp_price   = round(close - 3.0 * atr, 2),
             sl_price   = round(close + 1.0 * atr, 2),
             confidence = conf,
-            reasons    = ["EMA9 crosses below EMA21", "MACD cross down",
+            reasons    = [trigger, confirm,
                           f"Vol {vol_r:.1f}x surge", f"RSI {rsi:.0f}"],
             exit_hints = ["EMA9 crosses back above EMA21",
                           "MACD crosses up with vol > 1.5x",
@@ -373,7 +397,7 @@ def strategy_bb_adx_reversal(df: pd.DataFrame) -> Optional[StrategySignal]:
     close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
     adx   = _get(df, "adx"); bb_mid = _get(df, "bb_mid")
     if not all([close, atr, rsi, adx, bb_mid]) or atr <= 0: return None
-    if adx >= 25: return None
+    if adx >= 30: return None   # relaxed from 25 — catches oversold/overbought extremes in mild trends
 
     rsi_prev = float(p["rsi"]) if "rsi" in p.index else rsi
     two_low  = float(c["close"]) <= float(c["bb_lower"]) and float(p["close"]) <= float(p["bb_lower"])
@@ -518,10 +542,24 @@ def strategy_orb(df: pd.DataFrame) -> Optional[StrategySignal]:
     vol_r  = float(c["volume"]) / vol_ma if vol_ma > 0 else 1.0
     vol_ok = vol_r >= 1.5
 
-    # Break = prior bar at or below ORB level, current bar clears it by 0.1×ATR
-    buffer     = 0.1 * atr
-    break_up   = float(p["close"]) <= orb_high + buffer and float(c["close"]) > orb_high + buffer
-    break_down = float(p["close"]) >= orb_low  - buffer and float(c["close"]) < orb_low  - buffer
+    # Look back up to 10 bars for the break — catches moves the bot may have missed
+    # when it started late or the scan interval skipped the exact break bar.
+    buffer = 0.1 * atr
+    lb     = min(10, len(df) - 1)
+    break_up = (
+        float(c["close"]) > orb_high + buffer and   # still above ORB now
+        any(
+            df["close"].iloc[i-1] <= orb_high + buffer and df["close"].iloc[i] > orb_high + buffer
+            for i in range(len(df) - lb, len(df)) if i > 0
+        )
+    )
+    break_down = (
+        float(c["close"]) < orb_low - buffer and    # still below ORB now
+        any(
+            df["close"].iloc[i-1] >= orb_low - buffer and df["close"].iloc[i] < orb_low - buffer
+            for i in range(len(df) - lb, len(df)) if i > 0
+        )
+    )
 
     # Don't fire if we're already far from ORB (late-day re-test, not a clean break)
     too_far_up   = float(c["close"]) > orb_high + 2.5 * orb_size

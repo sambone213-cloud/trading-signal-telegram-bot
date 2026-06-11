@@ -88,7 +88,13 @@ def _fetch_yf_bars(symbol: str, interval: str = "1m", period: str = "1d") -> pd.
             "volume":   hist["Volume"].values,
         })
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-        return df.sort_values("datetime").reset_index(drop=True)
+        df = df.sort_values("datetime").reset_index(drop=True)
+        # Drop the last bar if it has zero volume — it's an in-progress bar.
+        # All volume-gated strategies divide by this bar's volume; a 0 gives vol 0.0x
+        # which permanently blocks Momentum Flip, VWAP Reclaim, Trend Breakout, ORB.
+        if len(df) > 1 and df["volume"].iloc[-1] == 0:
+            df = df.iloc[:-1].reset_index(drop=True)
+        return df
     except Exception as e:
         print(f"  [yf] {symbol}: {e}")
         return pd.DataFrame()

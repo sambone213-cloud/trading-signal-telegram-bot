@@ -89,6 +89,10 @@ class ExitManager:
         """
         Call every scan. Returns exit reason string if exit triggered, else None.
         Fires Telegram alert on exit signal.
+
+        NOTE: current_premium is ignored for P&L — ATR×0.5 is not a real option price.
+        Exit timing is driven purely by underlying price action (RSI, VWAP, EMA crosses).
+        P&L display shows the underlying move against the entry price instead.
         """
         pos = self._positions.get(symbol)
         if pos is None:
@@ -105,56 +109,41 @@ class ExitManager:
         except Exception:
             return None
 
-        # Track peak premium
-        pos.peak_premium = max(pos.peak_premium, current_premium)
+        # Underlying move since entry — this is what actually matters
+        raw_move  = close - pos.entry_price
+        # For a short, a move DOWN is profitable; for a long, a move UP is profitable
+        direction = -1 if pos.side == "short" else 1
+        underlying_pnl = direction * raw_move   # positive = in your favour
 
-        mult = current_premium / pos.entry_premium if pos.entry_premium > 0 else 1.0
-        pnl_pct = (mult - 1) * 100
-
-        # ── Hard stop: 50% loss ──────────────────────────────────────────────
-        if mult <= 0.50:
-            return self._fire_exit(symbol, pos, current_premium, pnl_pct,
-                                   "🛑 HARD STOP — 50% loss", tier=0)
-
-        # ── Tier 1: 1.5× → lock half ────────────────────────────────────────
-        if not pos.tier1_done and mult >= 1.5:
+        # ── Tier 1: underlying moved 1×ATR in your favour → alert to scale out ─
+        if not pos.tier1_done and underlying_pnl >= 1.0 * atr:
             pos.tier1_done = True
             self._send(
-                symbol, pos, current_premium, pnl_pct,
-                f"🟡 TIER 1 EXIT — Sell 50% at {mult:.1f}× ({pnl_pct:+.0f}%)\n"
-                f"Remaining 50% is now FREE — let it run"
+                symbol, pos, close, underlying_pnl,
+                f"🟡 TIER 1 — Underlying moved ${underlying_pnl:+.2f} in your favour\n"
+                f"Consider selling 50% of your option position"
             )
-            # Don't close the position — trail the runner
-            return f"TIER1 at {mult:.1f}x"
+            return f"TIER1 at +{underlying_pnl:.2f}"
 
-        # ── Tier 2: dynamic trail (only after tier 1) ────────────────────────
-        if pos.tier1_done:
-            reversal = self._reversal_check(pos, rsi, vwap, ema9, ema21, close)
-            if reversal:
-                pos.clean_scans = 0
-                # Check Tier 3 runner condition before exiting
-                runner = (
-                    adx > 25 and
-                    abs(close - pos.entry_price) > 1.5 * atr and
-                    pos.clean_scans >= 3
-                )
-                if runner:
-                    pos.clean_scans = 0  # reset but don't exit — it's a runner
-                    self._send(symbol, pos, current_premium, pnl_pct,
-                               f"🚀 RUNNER ACTIVE — {reversal} but ADX {adx:.0f} + strong trend\n"
-                               f"Holding runner — monitor closely")
-                    return f"RUNNER: {reversal}"
-                else:
-                    return self._fire_exit(symbol, pos, current_premium, pnl_pct,
-                                           f"🔴 TIER 2 EXIT — {reversal}", tier=2)
+        # ── Tier 2: reversal signal → exit remaining ─────────────────────────
+        reversal = self._reversal_check(pos, rsi, vwap, ema9, ema21, close)
+        if reversal:
+            pos.clean_scans = 0
+            runner = (
+                adx > 25 and
+                underlying_pnl > 1.5 * atr and
+                pos.tier1_done
+            )
+            if runner:
+                self._send(symbol, pos, close, underlying_pnl,
+                           f"🚀 RUNNER — {reversal} but ADX {adx:.0f} strong\n"
+                           f"Holding runner — monitor closely")
+                return f"RUNNER: {reversal}"
             else:
-                pos.clean_scans += 1
-
-        # ── Tier 3: 4× target alert ──────────────────────────────────────────
-        if mult >= 4.0 and pos.tier1_done:
-            self._send(symbol, pos, current_premium, pnl_pct,
-                       f"🎯 4× TARGET HIT — Consider full exit\n"
-                       f"Premium: ${pos.entry_premium:.2f} → ${current_premium:.2f} ({pnl_pct:+.0f}%)")
+                return self._fire_exit(symbol, pos, close, underlying_pnl,
+                                       f"🔴 EXIT SIGNAL — {reversal}", tier=2)
+        else:
+            pos.clean_scans += 1
 
         return None
 
@@ -176,22 +165,23 @@ class ExitManager:
                 return "EMA9 crossed above EMA21"
         return None
 
-    def _fire_exit(self, symbol, pos, current_premium, pnl_pct, reason, tier) -> str:
-        self._send(symbol, pos, current_premium, pnl_pct, reason)
+    def _fire_exit(self, symbol, pos, close, underlying_pnl, reason, tier) -> str:
+        self._send(symbol, pos, close, underlying_pnl, reason)
         self._positions.pop(symbol, None)
         return reason
 
-    def _send(self, symbol, pos, current_premium, pnl_pct, message):
-        held = int((datetime.datetime.now() - pos.entry_time).total_seconds() / 60)
+    def _send(self, symbol, pos, close, underlying_pnl, message):
+        held      = int((datetime.datetime.now() - pos.entry_time).total_seconds() / 60)
+        move_str  = f"${underlying_pnl:+.2f} {'in your favour' if underlying_pnl > 0 else 'against you'}"
         text = (
             f"{message}\n"
             f"──────────────────────\n"
             f"📐 {pos.strategy}  {pos.side.upper()}\n"
-            f"💲 Entry: ${pos.entry_premium:.2f}  →  Now: ${current_premium:.2f}\n"
-            f"📊 P&L: {pnl_pct:+.0f}%  |  Held: {held}m\n"
+            f"💲 Entry: ${pos.entry_price:.2f}  →  Now: ${close:.2f}\n"
+            f"📊 Underlying move: {move_str}  |  Held: {held}m\n"
             f"🕐 {datetime.datetime.now().strftime('%H:%M ET')}"
         )
-        print(f"\n{message} — {symbol} {pnl_pct:+.0f}%")
+        print(f"\n{message} — {symbol} underlying {move_str}")
         if self._tg:
             try:
                 self._tg.send_raw(text)

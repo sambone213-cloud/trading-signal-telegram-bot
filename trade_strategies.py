@@ -396,12 +396,20 @@ def strategy_bb_adx_reversal(df: pd.DataFrame) -> Optional[StrategySignal]:
     c, p  = df.iloc[-1], df.iloc[-2]
     close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
     adx   = _get(df, "adx"); bb_mid = _get(df, "bb_mid")
-    if not all([close, atr, rsi, adx, bb_mid]) or atr <= 0: return None
+    ema9  = _get(df, "ema9");  ema21 = _get(df, "ema21")
+    if not all([close, atr, rsi, adx, bb_mid, ema9, ema21]) or atr <= 0: return None
     if adx >= 30: return None   # relaxed from 25 — catches oversold/overbought extremes in mild trends
 
     rsi_prev = float(p["rsi"]) if "rsi" in p.index else rsi
     two_low  = float(c["close"]) <= float(c["bb_lower"]) and float(p["close"]) <= float(p["bb_lower"])
     two_high = float(c["close"]) >= float(c["bb_upper"]) and float(p["close"]) >= float(p["bb_upper"])
+
+    ema_bull = ema9 > ema21
+    ema_bear = ema9 < ema21
+
+    # Don't fire counter-trend: no SHORT in uptrend, no LONG in downtrend
+    if two_low and ema_bear: return None   # price below BB but EMA already bearish — not a reversal setup
+    if two_high and ema_bull: return None  # price above BB in a bull trend — don't fade it
 
     if two_low and rsi < 35 and rsi > rsi_prev:
         conf = _score_confidence(df, 0.70, "long")

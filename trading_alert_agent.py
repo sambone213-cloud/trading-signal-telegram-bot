@@ -163,6 +163,13 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.rolling(14).mean()
 
+    # Keltner Channels (EMA20 mid ± 2×ATR10) — used by Keltner Bounce strategy
+    ema20_kc = close.ewm(span=20, adjust=False).mean()
+    atr10    = tr.rolling(10).mean()
+    df["kc_mid"]   = ema20_kc
+    df["kc_upper"] = ema20_kc + 2 * atr10
+    df["kc_lower"] = ema20_kc - 2 * atr10
+
     # VWAP (session-level — resets each day via cumulative)
     if "volume" in df.columns:
         df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
@@ -502,12 +509,44 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
             ema9_val = float(df["ema9"].iloc[-1]) if "ema9" in df.columns else 0
             ema21_val= float(df["ema21"].iloc[-1]) if "ema21" in df.columns else 0
 
+            # Diagnostics — show how close each strategy's gating conditions are
+            adx_val   = float(df["adx"].iloc[-1]) if "adx" in df.columns and pd.notna(df["adx"].iloc[-1]) else None
+            vr_val    = float(df["vol_ratio"].iloc[-1]) if "vol_ratio" in df.columns and pd.notna(df["vol_ratio"].iloc[-1]) else None
+            bb_lo     = float(df["bb_lower"].iloc[-1]) if "bb_lower" in df.columns else None
+            bb_hi     = float(df["bb_upper"].iloc[-1]) if "bb_upper" in df.columns else None
+            kc_lo     = float(df["kc_lower"].iloc[-1]) if "kc_lower" in df.columns else None
+            kc_hi     = float(df["kc_upper"].iloc[-1]) if "kc_upper" in df.columns else None
+            macd_val  = float(df["macd"].iloc[-1]) if "macd" in df.columns else None
+            macd_sig  = float(df["macd_signal"].iloc[-1]) if "macd_signal" in df.columns else None
+
+            adx_str = f"ADX {adx_val:.0f}" if adx_val is not None else "ADX n/a"
+            vr_str  = f"vol {vr_val:.1f}x" if vr_val is not None else "vol n/a"
+
+            if bb_hi is not None and price > bb_hi:
+                bb_pos = "BB:above_upper"
+            elif bb_lo is not None and price < bb_lo:
+                bb_pos = "BB:below_lower"
+            else:
+                bb_pos = "BB:inside"
+
+            if kc_hi is not None and price > kc_hi:
+                kc_pos = "KC:above_upper"
+            elif kc_lo is not None and price < kc_lo:
+                kc_pos = "KC:below_lower"
+            else:
+                kc_pos = "KC:inside"
+
+            macd_pos = "MACD:n/a"
+            if macd_val is not None and macd_sig is not None:
+                macd_pos = "MACD:bull" if macd_val > macd_sig else "MACD:bear"
+
             # Vishy: print current indicator snapshot each scan
             ema_trend = "EMA9>21 ↑" if ema9_val > ema21_val else "EMA9<21 ↓"
             vix_str   = f"VIX {vix:.1f}" if vix else "VIX N/A"
             print(
                 f"  [{symbol}] ${price:.2f}  RSI {rsi_val:.0f}  {ema_trend}  "
-                f"ATR {atr_val:.2f}  {vix_str}"
+                f"ATR {atr_val:.2f}  {vix_str}  {adx_str}  {vr_str}  "
+                f"{bb_pos}  {kc_pos}  {macd_pos}"
             )
 
             # Exit manager — evaluate open positions every scan

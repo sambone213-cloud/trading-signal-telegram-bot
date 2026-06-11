@@ -142,12 +142,17 @@ class ExitManager:
         # ── Tier 2: reversal signal → exit remaining ─────────────────────────
         reversal = self._reversal_check(pos, rsi, vwap, ema9, ema21, close)
         if reversal:
-            pos.clean_scans = 0
+            # Tier 3 runner: strong trend, deep in profit, half already off, AND
+            # the trend was clean for 3+ scans before this blip. clean_scans must
+            # be read BEFORE resetting — resetting first made runners impossible
+            # in the original design, then the check was dropped entirely.
             runner = (
                 adx > 25 and
                 underlying_pnl > 1.5 * atr and
-                pos.tier1_done
+                pos.tier1_done and
+                pos.clean_scans >= 3
             )
+            pos.clean_scans = 0
             if runner:
                 self._send(symbol, pos, close, underlying_pnl,
                            f"🚀 RUNNER — {reversal} but ADX {adx:.0f} strong\n"

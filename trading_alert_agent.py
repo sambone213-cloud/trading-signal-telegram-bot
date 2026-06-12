@@ -750,6 +750,21 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                     ok, reason = pm.evaluate(sig, bar_time)
                     if not ok:
                         print(f"  [SUPPRESSED] {sig.strategy} {sig.side} — {reason}")
+                        # Past the daily trade cap: the human decides, so keep
+                        # informing — clearly labeled, not tracked as a position.
+                        if reason.startswith("max"):
+                            try:
+                                _get_tg().send_signal(
+                                    symbol=symbol, strategy=sig.strategy,
+                                    signal="BUY" if sig.side == "long" else "SELL",
+                                    price=price,
+                                    details=("⚠️ INFO ONLY — past the 2-trade daily limit, "
+                                             "not tracked for exits\n"
+                                             + "  ·  ".join(sig.reasons)
+                                             + f"\nConfidence: {sig.conf_label}"),
+                                )
+                            except Exception:
+                                pass
                         continue
                     pm.register(sig, bar_time)
                     _entry_times[symbol] = bar_time
@@ -770,7 +785,9 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                         strategy=sig.strategy,
                         signal=tg_signal,
                         price=price,
-                        details=details + f"\n{_option_guidance(sig, price, vix)}",
+                        details=details
+                                + f"\nConfidence: {sig.conf_label}"
+                                + f"\n{_option_guidance(sig, price, vix)}",
                     )
                 except Exception:
                     pass

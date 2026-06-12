@@ -744,28 +744,12 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                 if sig.strategy in ("BB+ADX Reversal", "Keltner Bounce") and _et_now().time() < datetime.time(10, 30):
                     continue
 
-                # Position manager gate — prevents flip-flopping and enforces max trades
+                # No gating — every deduped signal alerts in full. Sam keeps his
+                # own trade discipline; the bot informs, the human decides.
+                # PM just tracks the latest signal as the virtual position so
+                # exit alerts stay relevant to the most recent setup.
                 if pm:
                     bar_time = _et_now()
-                    ok, reason = pm.evaluate(sig, bar_time)
-                    if not ok:
-                        print(f"  [SUPPRESSED] {sig.strategy} {sig.side} — {reason}")
-                        # Past the daily trade cap: the human decides, so keep
-                        # informing — clearly labeled, not tracked as a position.
-                        if reason.startswith("max"):
-                            try:
-                                _get_tg().send_signal(
-                                    symbol=symbol, strategy=sig.strategy,
-                                    signal="BUY" if sig.side == "long" else "SELL",
-                                    price=price,
-                                    details=("⚠️ INFO ONLY — past the 2-trade daily limit, "
-                                             "not tracked for exits\n"
-                                             + "  ·  ".join(sig.reasons)
-                                             + f"\nConfidence: {sig.conf_label}"),
-                                )
-                            except Exception:
-                                pass
-                        continue
                     pm.register(sig, bar_time)
                     _entry_times[symbol] = bar_time
 
@@ -830,7 +814,7 @@ def main():
     else:
         print("  Data     : yfinance only")
     tracker = DailyTracker()
-    pm      = PositionManager(lockout_minutes=15, max_trades_per_day=2)
+    pm      = PositionManager(lockout_minutes=15, max_trades_per_day=999)  # alerts never gated
     em      = ExitManager(notifier=_get_tg())
 
     print(f"\n{'='*56}")

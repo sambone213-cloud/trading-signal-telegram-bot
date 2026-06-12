@@ -528,8 +528,14 @@ def strategy_orb(df: pd.DataFrame) -> Optional[StrategySignal]:
     if not _has(df, "close","high","low","ema9","ema21","atr","volume","hour_et","minute_et"):
         return None
 
-    # Identify opening range bars: 9:30–9:59 ET
+    # Identify opening range bars: 9:30–9:59 ET — TODAY only. The live feed
+    # now carries 2 days of bars, so without a date filter the opening range
+    # would span yesterday's open too.
     orb_mask = (df["hour_et"] == 9) & (df["minute_et"] >= 30)
+    if "datetime" in df.columns:
+        # market-hours bars: UTC date == ET date, so this is safe
+        last_date = df["datetime"].iloc[-1].date()
+        orb_mask = orb_mask & (df["datetime"].dt.date == last_date)
     orb_bars  = df[orb_mask]
     if len(orb_bars) < 20:   # need at least 20 bars to define the range
         return None

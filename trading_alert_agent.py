@@ -634,9 +634,12 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
 
     for symbol in symbols:
         try:
-            raw = _fetch_yf_bars(symbol, interval="1m", period="1d")
+            # 2 days of bars: prior session warms up EMA50/ADX/DI so strategies
+            # can fire at the open — with 1d, the >=35-bar minimum meant nothing
+            # could fire before ~10:05 and Opening Drive (9:45-10:00) was dead.
+            raw = _fetch_yf_bars(symbol, interval="1m", period="2d")
             bars = raw if not raw.empty else (
-                _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Min", limit=200))
+                _bars_to_df(client.get_bars_ohlcv(symbol, timeframe="1Min", limit=600))
                 if client else pd.DataFrame()
             )
             if bars.empty or len(bars) < 20:
@@ -849,10 +852,26 @@ def main():
     HEARTBEAT_INTERVAL        = 600    # market hours: every 10 minutes
     HEARTBEAT_CLOSED_INTERVAL = 14400  # market closed: every 4 hours, light ping
     _briefing_day = None               # market-open briefing sent once per trading day
+    _report_day   = None               # EOD report card sent once per trading day
 
     while True:
         now_str = _et_now().strftime("%H:%M:%S ET")
         print(f"\n[{now_str}] Scanning {', '.join(args.symbols)}...")
+
+        # EOD report card at 16:05 ET — replays the day, scores every signal,
+        # sends the running per-strategy track record
+        now_et = _et_now()
+        if (now_et.weekday() < 5 and now_et.time() >= datetime.time(16, 5)
+                and _report_day != now_et.date()):
+            _report_day = now_et.date()
+            try:
+                from report_card import build_report
+                for sym in args.symbols:
+                    text = build_report(sym)
+                    print(f"\n{text}\n")
+                    _get_tg().send_raw(text)
+            except Exception as e:
+                print(f"  [report] {e}")
 
         # Market-open briefing: levels + outlook, once per day at first scan
         # after 9:30. Also refreshes key levels (boot-time levels go stale).

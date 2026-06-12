@@ -859,9 +859,11 @@ def main():
         print(f"\n[{now_str}] Scanning {', '.join(args.symbols)}...")
 
         # EOD report card at 16:05 ET — replays the day, scores every signal,
-        # sends the running per-strategy track record
+        # sends the running per-strategy track record. Window-bounded so an
+        # evening redeploy doesn't resend it (run report_card.py manually then).
         now_et = _et_now()
-        if (now_et.weekday() < 5 and now_et.time() >= datetime.time(16, 5)
+        if (now_et.weekday() < 5
+                and datetime.time(16, 5) <= now_et.time() < datetime.time(18, 0)
                 and _report_day != now_et.date()):
             _report_day = now_et.date()
             try:

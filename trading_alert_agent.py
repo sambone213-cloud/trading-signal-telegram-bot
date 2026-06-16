@@ -48,6 +48,7 @@ def _bars_to_df(bars: list) -> pd.DataFrame:
 from trade_strategies import run_all_strategies, StrategySignal, check_exit_conditions
 from position_manager import PositionManager
 from exit_manager import ExitManager
+from level_trader import LevelMonitor, briefing_plays
 
 try:
     from telegram_notify import get_notifier as _get_tg
@@ -463,6 +464,23 @@ def build_open_briefing(client, symbol: str):
     if outlook:
         lines.append("──────────────────────")
         lines.extend(outlook)
+
+    # Flat level list (also returned for the scanner's proximity + level monitor)
+    flat = [lvls[k] for k in ("prior_high", "prior_low", "prior_close",
+                              "premarket_high", "premarket_low") if lvls.get(k)]
+    flat += lvls.get("swing_highs", []) + lvls.get("swing_lows", [])
+    flat = sorted(set(flat))
+
+    # Level plays — break/retest/target around the expected open price
+    ref_price = pre_last or lvls.get("prior_close")
+    if ref_price and daily_atr:
+        # daily_atr is a daily range; use a 1-min-ish fraction for intraday buffers
+        plays = briefing_plays(flat, ref_price, max(daily_atr * 0.08, 0.15))
+        if plays:
+            lines.append("──────────────────────")
+            lines.append("📐 Level plays:")
+            lines.extend(plays)
+
     lines.append("──────────────────────")
     lines.append("Today's windows:")
     lines.append("9:45–10:00  Opening Drive (DI direction)")
@@ -471,12 +489,7 @@ def build_open_briefing(client, symbol: str):
     lines.append("3:00–3:55   Power Hour Dip")
     lines.append("All day     Dip Buy · Keltner · Momentum · Trend · VWAP · BB+ADX")
 
-    # Flat level list for the scanner's proximity checks
-    flat = [lvls[k] for k in ("prior_high", "prior_low", "prior_close",
-                              "premarket_high", "premarket_low") if lvls.get(k)]
-    flat += lvls.get("swing_highs", []) + lvls.get("swing_lows", [])
-
-    return "\n".join(lines), sorted(set(flat))
+    return "\n".join(lines), flat
 
 
 # ── Level proximity check ─────────────────────────────────────────────────────
@@ -622,7 +635,7 @@ def _is_duplicate(symbol: str, sig: StrategySignal, price: float, atr: float) ->
 
 # ── Main scanner ─────────────────────────────────────────────────────────────
 
-def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: PositionManager = None, em: ExitManager = None):
+def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: PositionManager = None, em: ExitManager = None, lm: LevelMonitor = None):
     """One full scan pass across all symbols."""
 
     if not _market_open():
@@ -712,6 +725,19 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
                 f"ATR {atr_val:.2f}  {vix_str}  {adx_str}  {vr_str}  "
                 f"{bb_pos}  {kc_pos}  {macd_pos}  REGIME:{regime_str}"
             )
+
+            # Level plays — break / retest / continuation on the day's key levels
+            if lm is not None:
+                try:
+                    for play in lm.update(symbol, key_levels.get(symbol, []),
+                                          price, atr_val, _et_now(), regime_str):
+                        print(f"\n{play}\n")
+                        try:
+                            _get_tg().send_raw(play)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"  [level] {symbol}: {e}")
 
             # Exit manager — evaluate open positions every scan
             if em:
@@ -834,6 +860,7 @@ def main():
     tracker = DailyTracker()
     pm      = PositionManager(lockout_minutes=15, max_trades_per_day=999)  # alerts never gated
     em      = ExitManager(notifier=_get_tg())
+    lm      = LevelMonitor()
 
     print(f"\n{'='*56}")
     print(f"  QuantDesk Alert Agent")
@@ -909,7 +936,7 @@ def main():
                     print(f"  [briefing] {sym}: {e}")
             _briefing_day = _et_now().date()
 
-        scan(client, args.symbols, tracker, key_levels, pm, em)
+        scan(client, args.symbols, tracker, key_levels, pm, em, lm)
 
         # Telegram heartbeat so you know it's alive on your phone
         hb_interval = HEARTBEAT_INTERVAL if _market_open() else HEARTBEAT_CLOSED_INTERVAL

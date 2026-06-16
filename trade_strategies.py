@@ -78,6 +78,63 @@ def _prev(df, col):
     except: return None
 
 
+# ── Market regime engine ──────────────────────────────────────────────────────
+# Both of Sam's losing days (Jun 13, Jun 15) were chop. Trend-following setups
+# fired into directionless tape and bled to their stops. The regime layer scores
+# each signal's fit to current conditions so chop signals are visibly low-conviction.
+
+TREND_STRATEGIES = {"Momentum Flip", "Trend Breakout", "ORB Breakout",
+                    "Opening Drive", "VWAP Reclaim", "Power Hour Dip"}
+MEANREV_STRATEGIES = {"Keltner Bounce", "BB+ADX Reversal",
+                      "Oversold Dip Buy", "Lunch VWAP Hold"}
+
+
+def price_efficiency(df, n: int = 20) -> float:
+    """
+    Net move / total path over last n bars. ~1.0 = clean directional move,
+    near 0 = chop (lots of motion, no progress). Regime measure that does NOT
+    depend on ADX — ADX is unreliable for ~15 bars after an overnight gap
+    (Jun 15 read ADX 87 at 9:45 because the 740->753 gap spiked the DI calc).
+    """
+    try:
+        c = df["close"].tail(n + 1)
+        if len(c) < n + 1:
+            return 0.5
+        net  = abs(float(c.iloc[-1]) - float(c.iloc[0]))
+        path = float(c.diff().abs().sum())
+        return net / path if path > 0 else 0.0
+    except Exception:
+        return 0.5
+
+
+def market_regime(df) -> str:
+    """TREND_UP | TREND_DOWN | CHOP | MIXED from price efficiency + EMA stack."""
+    eff   = price_efficiency(df)
+    ema9  = _get(df, "ema9"); ema21 = _get(df, "ema21"); ema50 = _get(df, "ema50")
+    mins  = _get(df, "mins_since_open")
+    if None in (ema9, ema21, ema50):
+        return "MIXED"
+    # First 15 min after the open: ADX/DI unstable on gap days, don't label TREND
+    if mins is not None and mins < 15:
+        return "MIXED"
+    if eff >= 0.38 and ema9 > ema21 > ema50:
+        return "TREND_UP"
+    if eff >= 0.38 and ema9 < ema21 < ema50:
+        return "TREND_DOWN"
+    if eff < 0.22:
+        return "CHOP"
+    return "MIXED"
+
+
+def regime_fit(strategy: str, regime: str) -> str:
+    """'good' | 'poor' | 'neutral' — does the strategy's type suit the regime?"""
+    if regime in ("TREND_UP", "TREND_DOWN"):
+        return "good" if strategy in TREND_STRATEGIES else "poor"
+    if regime == "CHOP":
+        return "good" if strategy in MEANREV_STRATEGIES else "poor"
+    return "neutral"
+
+
 # ── Dynamic confidence scorer ─────────────────────────────────────────────────
 
 def _score_confidence(df, base: float, side: str) -> float:
@@ -669,38 +726,50 @@ def strategy_opening_drive(df: pd.DataFrame) -> Optional[StrategySignal]:
 
     Backtest: long E=+0.31 WR=50%, short E=+0.27 WR=48%, ~1.1 fires/day
     """
-    if not _has(df, "close","plus_di","minus_di","rsi","atr"):
+    if not _has(df, "close","plus_di","minus_di","rsi","atr","ema9","ema21","volume"):
         return None
     close = _get(df, "close"); atr = _get(df, "atr"); rsi = _get(df, "rsi")
     pdi   = _get(df, "plus_di"); mdi = _get(df, "minus_di")
-    if not all([close, atr, rsi]) or atr <= 0: return None
+    ema9  = _get(df, "ema9");    ema21 = _get(df, "ema21")
+    if not all([close, atr, rsi, ema9, ema21]) or atr <= 0: return None
     if pdi is None or mdi is None: return None
 
     mins = _get(df, "mins_since_open")
     if mins is None or mins >= 30: return None
 
-    if pdi > mdi:
+    # DI must be decisively separated — marginal crosses whipsaw at the open.
+    # Jun 15 9:45 fired SHORT on -DI 25 vs +DI 17 while EMA9>EMA21 (bullish),
+    # exited for $0.00 in seconds. The EMA-coherence requirement blocks that.
+    di_sep = abs(pdi - mdi)
+    if di_sep < 8: return None
+
+    # Volume floor — the worst opens fired on 0.3x dead volume.
+    vol_ma = df["volume"].rolling(20, min_periods=5).mean().iloc[-1]
+    vol_r  = float(df["volume"].iloc[-1]) / vol_ma if vol_ma > 0 else 1.0
+    if vol_r < 0.8: return None
+
+    if pdi > mdi and ema9 > ema21:           # DI and EMA both bullish
         conf = _score_confidence(df, 0.74, "long")
         return StrategySignal(
             "Opening Drive", "long", close,
             tp_price   = round(close + 2.5 * atr, 2),
             sl_price   = round(close - 1.0 * atr, 2),
             confidence = conf,
-            reasons    = [f"+DI {pdi:.0f} > -DI {mdi:.0f} buyers in control",
-                          "Opening 30 min drive", f"RSI {rsi:.0f}"],
+            reasons    = [f"+DI {pdi:.0f} > -DI {mdi:.0f} (sep {di_sep:.0f})",
+                          "EMA9>21 confirms", f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}"],
             exit_hints = ["Price breaks below VWAP",
                           "-DI crosses above +DI", "RSI > 75"],
         )
 
-    if mdi > pdi:
+    if mdi > pdi and ema9 < ema21:           # DI and EMA both bearish
         conf = _score_confidence(df, 0.74, "short")
         return StrategySignal(
             "Opening Drive", "short", close,
             tp_price   = round(close - 2.5 * atr, 2),
             sl_price   = round(close + 1.0 * atr, 2),
             confidence = conf,
-            reasons    = [f"-DI {mdi:.0f} > +DI {pdi:.0f} sellers in control",
-                          "Opening 30 min drive", f"RSI {rsi:.0f}"],
+            reasons    = [f"-DI {mdi:.0f} > +DI {pdi:.0f} (sep {di_sep:.0f})",
+                          "EMA9<21 confirms", f"Vol {vol_r:.1f}x", f"RSI {rsi:.0f}"],
             exit_hints = ["Price reclaims VWAP",
                           "+DI crosses above -DI", "RSI < 25"],
         )
@@ -726,14 +795,17 @@ def strategy_lunch_vwap_hold(df: pd.DataFrame) -> Optional[StrategySignal]:
     if not all([close, atr, rsi, vwap]) or atr <= 0: return None
     if hour_et is None or hour_et != 12: return None
 
-    if close > vwap:
+    # Require price a clear 0.25xATR ABOVE vwap, not just touching it. On Jun 13
+    # and Jun 15 this fired 4x each day while price chopped right on top of vwap
+    # (25% live win rate). The buffer demands genuine separation.
+    if close > vwap + 0.25 * atr:
         conf = _score_confidence(df, 0.72, "long")
         return StrategySignal(
             "Lunch VWAP Hold", "long", close,
             tp_price   = round(close + 2.5 * atr, 2),
             sl_price   = round(close - 1.0 * atr, 2),
             confidence = conf,
-            reasons    = [f"Holding above VWAP ${vwap:.2f} through lunch",
+            reasons    = [f"${close - vwap:.2f} above VWAP through lunch",
                           f"RSI {rsi:.0f}"],
             exit_hints = ["Price breaks below VWAP",
                           "RSI > 75", "EMA9 crosses below EMA21"],
@@ -766,11 +838,19 @@ def run_all_strategies(
 ) -> List[StrategySignal]:
     fns = {k: v for k, v in ALL_STRATEGIES.items()
            if enabled is None or k in enabled}
+    regime = market_regime(df)
     signals = []
     for name, fn in fns.items():
         try:
             sig = fn(df)
             if sig is not None:
+                # Regime overlay: penalize counter-regime conviction, annotate fit.
+                fit = regime_fit(sig.strategy, regime)
+                if fit == "poor":
+                    sig.confidence = round(max(0.55, sig.confidence - 0.12), 2)
+                    sig.reasons.append(f"⚠️ {regime} regime — counter to setup")
+                elif fit == "good":
+                    sig.reasons.append(f"✓ {regime} regime aligned")
                 signals.append(sig)
                 if notify and symbol:
                     try:

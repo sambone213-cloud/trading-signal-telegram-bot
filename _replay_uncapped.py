@@ -25,6 +25,7 @@ start, end = day_idx[0], day_idx[-1]
 open_trades = []   # dicts: strategy, side, entry_price, entry_et, tp, sl, conf, entry_bar
 closed = []
 last_fire = {}
+last_fire_time = {}
 
 # Precompute indicator windows once per bar is expensive; reuse the window df
 for i in range(start, end + 1):
@@ -57,14 +58,19 @@ for i in range(start, end + 1):
                            "cause": cause, "pnl": pnl})
     open_trades = still_open
 
-    # 2. New signals — every one becomes a trade
+    # 2. New signals — every one becomes a trade. Dedup mirrors the live agent:
+    # 2xATR price gate OR 20-min cooldown per strategy/side.
     sigs = run_all_strategies(window, notify=False)
     atr = float(bar["atr"]) if pd.notna(bar["atr"]) else 0.5
+    bar_dt = window["datetime"].iloc[-1]
     for s in sigs:
         key = (s.strategy, s.side)
         if key in last_fire and abs(price - last_fire[key]) < 2 * atr:
             continue
+        if key in last_fire_time and (bar_dt - last_fire_time[key]).total_seconds() < 20 * 60:
+            continue
         last_fire[key] = price
+        last_fire_time[key] = bar_dt
         open_trades.append({
             "strategy": s.strategy, "side": s.side, "entry_price": price,
             "entry_et": et, "tp": s.tp_price, "sl": s.sl_price,

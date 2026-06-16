@@ -588,22 +588,35 @@ class DailyTracker:
 
 # ── Signal deduplication — suppress repeat fires until strategy resets ────────
 
-_last_signal: dict = {}          # symbol -> {strategy -> last_fire_price}
+_last_signal: dict = {}          # (symbol,strategy,side) -> last_fire_price
+_last_signal_time: dict = {}     # (symbol,strategy,side) -> last_fire datetime
 _entry_times: dict = {}          # symbol -> entry datetime for bars_held calculation
 _signal_day = None               # resets the dedup memory each trading day
 
+SIGNAL_COOLDOWN_MIN = 20         # min minutes before same strategy/side re-alerts
+
 def _is_duplicate(symbol: str, sig: StrategySignal, price: float, atr: float) -> bool:
-    """Return True if same strategy fired within 2×ATR of last fire price."""
+    """
+    Suppress a repeat if the same strategy/side fired EITHER within 2xATR of its
+    last fire price OR within the cooldown window. The time gate is what tames
+    the over-firers — Lunch VWAP and Opening Drive were alerting 4-5x/day.
+    """
     global _signal_day
-    today = _et_now().date()
+    now = _et_now()
+    today = now.date()
     if _signal_day != today:
         _last_signal.clear()
+        _last_signal_time.clear()
         _signal_day = today
     key = (symbol, sig.strategy, sig.side)
     last = _last_signal.get(key)
+    last_t = _last_signal_time.get(key)
     if last is not None and abs(price - last) < 2 * atr:
         return True
+    if last_t is not None and (now - last_t).total_seconds() < SIGNAL_COOLDOWN_MIN * 60:
+        return True
     _last_signal[key] = price
+    _last_signal_time[key] = now
     return False
 
 
@@ -689,10 +702,15 @@ def scan(client, symbols: list, tracker: DailyTracker, key_levels: dict, pm: Pos
             # Vishy: print current indicator snapshot each scan
             ema_trend = "EMA9>21 ↑" if ema9_val > ema21_val else "EMA9<21 ↓"
             vix_str   = f"VIX {vix:.1f}" if vix else "VIX N/A"
+            try:
+                from trade_strategies import market_regime
+                regime_str = market_regime(df)
+            except Exception:
+                regime_str = "?"
             print(
                 f"  [{symbol}] ${price:.2f}  RSI {rsi_val:.0f}  {ema_trend}  "
                 f"ATR {atr_val:.2f}  {vix_str}  {adx_str}  {vr_str}  "
-                f"{bb_pos}  {kc_pos}  {macd_pos}"
+                f"{bb_pos}  {kc_pos}  {macd_pos}  REGIME:{regime_str}"
             )
 
             # Exit manager — evaluate open positions every scan

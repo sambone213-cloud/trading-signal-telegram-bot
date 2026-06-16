@@ -71,8 +71,16 @@ sigs_945 = ts.run_all_strategies(open_945, notify=False)
 check("strategies run at 9:45 without error", True,
       f"fired: {[s.strategy + ' ' + s.side for s in sigs_945] or 'none'}")
 od = ts.strategy_opening_drive(open_945)
-check("Opening Drive eligible at 9:45 (35-bar starvation fixed)",
-      od is not None, f"{od.side} conf {od.confidence}" if od else "DID NOT FIRE")
+# Opening Drive now requires DI/EMA coherence + DI sep>=8 + vol>=0.8x, so it
+# legitimately may NOT fire if the open is incoherent (that is the whole point —
+# it stops the EMA-vs-DI whipsaw). We only assert it RUNS without error and that
+# IF it fires, EMA agrees with the DI direction.
+coherent = True
+if od is not None:
+    e9 = float(open_945["ema9"].iloc[-1]); e21 = float(open_945["ema21"].iloc[-1])
+    coherent = (od.side == "long" and e9 > e21) or (od.side == "short" and e9 < e21)
+check("Opening Drive coherence gate (fires only when EMA agrees with DI)",
+      coherent, f"{od.side} conf {od.confidence}" if od else "no fire (incoherent open — correct)")
 mins = float(open_945["mins_since_open"].iloc[-1])
 check("mins_since_open correct at open", 0 <= mins < 30, f"{mins:.0f}m")
 
@@ -127,12 +135,16 @@ check("EM evaluate runs", res is None or isinstance(res, str), f"-> {res}")
 pm.force_close(agent._et_now())
 check("PM force_close clears position", pm._active_side is None)
 
-agent._last_signal.clear(); agent._signal_day = None
+agent._last_signal.clear(); agent._last_signal_time.clear(); agent._signal_day = None
 d1 = agent._is_duplicate("SPY", sig, 730.0, 0.5)
-d2_ = agent._is_duplicate("SPY", sig, 730.2, 0.5)
-d3 = agent._is_duplicate("SPY", sig, 732.5, 0.5)
-check("dedup: first passes, near repeat blocked, far re-fire passes",
-      (not d1) and d2_ and (not d3))
+d2_ = agent._is_duplicate("SPY", sig, 730.2, 0.5)   # near price -> blocked
+d3 = agent._is_duplicate("SPY", sig, 732.5, 0.5)    # far price BUT within 20m -> blocked by cooldown
+check("dedup: price gate + 20m cooldown both suppress repeats",
+      (not d1) and d2_ and d3)
+# After the cooldown elapses, a far-price re-fire is allowed again
+agent._last_signal_time[("SPY", sig.strategy, sig.side)] = agent._et_now() - datetime.timedelta(minutes=25)
+d4 = agent._is_duplicate("SPY", sig, 740.0, 0.5)
+check("dedup: re-fire allowed after 20m cooldown + price move", not d4)
 
 # ── 9. Exit conditions for all 10 strategies ─────────────────────────────────
 print("\n[9] check_exit_conditions all strategies x both sides")

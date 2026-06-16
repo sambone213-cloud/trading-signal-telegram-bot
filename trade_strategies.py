@@ -532,35 +532,40 @@ def check_exit_conditions(df: pd.DataFrame, position_side: str, strategy: str,
     # Minimum hold: Trend Breakout needs 10 bars before MACD exit is valid
     macd_min_hold = bars_held >= 10 or strategy not in ("Trend Breakout",)
 
+    # Give every trade room to breathe — structural exits (EMA/VWAP/VWMA cross)
+    # no longer fire in the first 3 bars. A one-bar wiggle right after entry was
+    # cutting trades at +$0.00. ExitManager's trailing stop handles winners; this
+    # is just a hard-reversal backstop now (RSI bands widened 78/22 -> 82/18).
+    structural_ok = bars_held >= 3
+
     # Momentum Flip: EMA cross triggered entry, so EMA cross alone isn't a valid exit.
-    # Exit only on MACD reversal (with vol) or VWAP flip or RSI extreme.
     is_flip = strategy == "Momentum Flip"
 
     if position_side == "long":
-        if rsi and rsi > 60 and strategy == "Oversold Dip Buy":
+        if rsi and rsi > 63 and strategy == "Oversold Dip Buy":
             return f"RSI recovered to {rsi:.0f} — dip-buy target reached"
-        if rsi and rsi > 78:
+        if rsi and rsi > 82:
             return f"RSI overbought {rsi:.0f} — exit"
-        if ema_flipped_bear and not is_flip:
+        if ema_flipped_bear and not is_flip and structural_ok:
             return "EMA9 crossed below EMA21 — trend reversed"
-        if vwap_break_down and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip",
-                                            "Opening Drive", "Lunch VWAP Hold"):
+        if vwap_break_down and structural_ok and strategy in ("Trend Breakout", "VWAP Reclaim",
+                                            "Momentum Flip", "Opening Drive", "Lunch VWAP Hold"):
             return "Price broke below VWAP — momentum lost"
         if macd_xdn and macd_vol_confirmed and macd_min_hold:
             return f"MACD crossed down with {vol_r:.1f}x vol — exit"
-        if vwma_xdn and strategy in ("Keltner Bounce", "Power Hour Dip"):
+        if vwma_xdn and structural_ok and strategy in ("Keltner Bounce", "Power Hour Dip"):
             return "VWMA9 crossed below VWMA21 — exit"
     else:
-        if rsi and rsi < 22:
+        if rsi and rsi < 18:
             return f"RSI oversold {rsi:.0f} — cover"
-        if ema_flipped_bull and not is_flip:
+        if ema_flipped_bull and not is_flip and structural_ok:
             return "EMA9 crossed above EMA21 — trend reversed"
-        if vwap_reclaim_up and strategy in ("Trend Breakout", "VWAP Reclaim", "Momentum Flip",
-                                            "Opening Drive"):
+        if vwap_reclaim_up and structural_ok and strategy in ("Trend Breakout", "VWAP Reclaim",
+                                            "Momentum Flip", "Opening Drive"):
             return "Price reclaimed VWAP — short thesis broken"
         if macd_xup and macd_vol_confirmed and macd_min_hold:
             return f"MACD crossed up with {vol_r:.1f}x vol — cover"
-        if vwma_xup and strategy == "BB+ADX Reversal":
+        if vwma_xup and structural_ok and strategy == "BB+ADX Reversal":
             return "VWMA9 crossed above VWMA21 — cover short"
 
     return None

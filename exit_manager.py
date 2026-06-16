@@ -56,9 +56,10 @@ class OpenPosition:
     entry_df_ema9:   float          # EMA9 at entry
 
     # State
-    tier1_done:      bool  = False  # half exited at 1.5×
+    tier1_done:      bool  = False  # half exited at the scale-out level
     clean_scans:     int   = 0      # consecutive scans with no reversal signal
     peak_premium:    float = 0.0    # highest premium seen since entry
+    peak_move:       float = 0.0    # best favourable underlying move (in $) since entry
 
 
 class ExitManager:
@@ -128,59 +129,65 @@ class ExitManager:
         # For a short, a move DOWN is profitable; for a long, a move UP is profitable
         direction = -1 if pos.side == "short" else 1
         underlying_pnl = direction * raw_move   # positive = in your favour
+        pos.peak_move  = max(pos.peak_move, underlying_pnl)
 
-        # ── Tier 1: underlying moved 1×ATR in your favour → alert to scale out ─
-        if not pos.tier1_done and underlying_pnl >= 1.0 * atr:
+        # ── Scale-out heads-up: 1.25×ATR in favour (informational, not an exit) ─
+        if not pos.tier1_done and underlying_pnl >= 1.25 * atr:
             pos.tier1_done = True
             self._send(
                 symbol, pos, close, underlying_pnl,
-                f"🟡 TIER 1 — Underlying moved ${underlying_pnl:+.2f} in your favour\n"
-                f"Consider selling 50% of your option position"
+                f"🟡 +${underlying_pnl:.2f} ({underlying_pnl/atr:.1f}×ATR) in favour\n"
+                f"Optional: take 50% off, let the rest run to target"
             )
             return f"TIER1 at +{underlying_pnl:.2f}"
 
-        # ── Tier 2: reversal signal → exit remaining ─────────────────────────
-        reversal = self._reversal_check(pos, rsi, vwap, ema9, ema21, close)
-        if reversal:
-            # Tier 3 runner: strong trend, deep in profit, half already off, AND
-            # the trend was clean for 3+ scans before this blip. clean_scans must
-            # be read BEFORE resetting — resetting first made runners impossible
-            # in the original design, then the check was dropped entirely.
-            runner = (
-                adx > 25 and
-                underlying_pnl > 1.5 * atr and
-                pos.tier1_done and
-                pos.clean_scans >= 3
-            )
-            pos.clean_scans = 0
-            if runner:
-                self._send(symbol, pos, close, underlying_pnl,
-                           f"🚀 RUNNER — {reversal} but ADX {adx:.0f} strong\n"
-                           f"Holding runner — monitor closely")
-                return f"RUNNER: {reversal}"
-            else:
+        # ── Winner that's working (peaked ≥1×ATR): TRAIL it, don't bail on noise ─
+        # This is the fix for early exits — once a trade is genuinely working we
+        # let it run toward target and only exit on a real giveback or a true
+        # extreme, NOT on RSI 72 or a hairline EMA cross.
+        if pos.peak_move >= 1.0 * atr:
+            # hard extreme always closes
+            if (pos.side == "long"  and rsi > 85) or \
+               (pos.side == "short" and rsi < 15):
                 return self._fire_exit(symbol, pos, close, underlying_pnl,
-                                       f"🔴 EXIT SIGNAL — {reversal}", tier=2)
-        else:
-            pos.clean_scans += 1
+                                       f"🔴 EXIT — RSI extreme {rsi:.0f}", tier=2)
+            # trailing stop: give back 50% of the best move → bank it
+            giveback = pos.peak_move - underlying_pnl
+            if giveback >= 0.5 * pos.peak_move:
+                return self._fire_exit(
+                    symbol, pos, close, underlying_pnl,
+                    f"🔴 TRAIL EXIT — peaked +${pos.peak_move:.2f}, "
+                    f"gave back to +${underlying_pnl:.2f}", tier=2)
+            return None   # still running — hold, ignore soft reversal noise
 
+        # ── Trade not working yet (peak <1×ATR): protect with reversal check ───
+        reversal = self._reversal_check(pos, rsi, vwap, ema9, ema21, close, atr)
+        if reversal:
+            return self._fire_exit(symbol, pos, close, underlying_pnl,
+                                   f"🔴 EXIT SIGNAL — {reversal}", tier=2)
         return None
 
-    def _reversal_check(self, pos, rsi, vwap, ema9, ema21, close) -> Optional[str]:
-        """Returns reversal reason string if exit condition met, else None."""
+    def _reversal_check(self, pos, rsi, vwap, ema9, ema21, close, atr) -> Optional[str]:
+        """
+        Reversal exits for a trade that hasn't worked yet. Loosened from the old
+        version (RSI 72/28, hairline EMA cross) which cut winners at +20¢:
+        RSI bands widened to 80/20 and EMA/VWAP crosses require a 0.05×ATR margin
+        so a one-bar wiggle no longer triggers an exit.
+        """
+        buf = 0.05 * atr
         if pos.side == "long":
-            if rsi > 72:
+            if rsi > 80:
                 return f"RSI overbought {rsi:.0f}"
-            if vwap > 0 and close < vwap and pos.entry_df_vwap > 0 and pos.entry_price > vwap:
-                return "Price crossed below VWAP"
-            if ema9 < ema21:
+            if vwap > 0 and close < vwap - buf and pos.entry_df_vwap > 0 and pos.entry_price > vwap:
+                return "Price broke below VWAP"
+            if ema9 < ema21 - buf:
                 return "EMA9 crossed below EMA21"
         else:  # short
-            if rsi < 28:
+            if rsi < 20:
                 return f"RSI oversold {rsi:.0f}"
-            if vwap > 0 and close > vwap and pos.entry_df_vwap > 0 and pos.entry_price < vwap:
-                return "Price crossed above VWAP"
-            if ema9 > ema21:
+            if vwap > 0 and close > vwap + buf and pos.entry_df_vwap > 0 and pos.entry_price < vwap:
+                return "Price broke above VWAP"
+            if ema9 > ema21 + buf:
                 return "EMA9 crossed above EMA21"
         return None
 
